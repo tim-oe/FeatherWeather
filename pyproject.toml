@@ -1,0 +1,105 @@
+[project]
+name = "featherweather"
+version = "0.1.0"
+description = "ESP32 Feather V2 weather station with GPS, RTC, and SD logging"
+authors = [
+    {name = "tcronin", email = "tecronin@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    # CircuitPython compatibility layer for running CP code on host (Blinka)
+    "Adafruit-Blinka (>=9.0.0,<10.0.0)",
+    # ESP32 Feather V2 - built-in NeoPixel
+    "adafruit-circuitpython-neopixel (>=6.3.0,<7.0.0)",
+    # Adalogger FeatherWing [2922] - PCF8523 RTC over I2C
+    "adafruit-circuitpython-pcf8523 (>=2.0.0,<3.0.0)",
+    # Adalogger FeatherWing [2922] - microSD over SPI
+    "adafruit-circuitpython-sd (>=3.3.0,<4.0.0)",
+    # Ultimate GPS FeatherWing [3133] - PA1616D/MTK3333 over UART
+    "adafruit-circuitpython-gps (>=3.10.0,<4.0.0)",
+    # BMP390 [4816] - Barometric pressure + altitude + temperature over I2C/SPI
+    "adafruit-circuitpython-bmp3xx (>=1.3.0,<2.0.0)",
+    # SHTC3 [4636] - Temperature + humidity over I2C (STEMMA QT, address 0x70)
+    "adafruit-circuitpython-shtc3 (>=1.1.0,<2.0.0)",
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<4.0"
+
+[project.scripts]
+lint = "scripts.lint:main"
+format = "scripts.lint:format_code"
+test = "scripts.test:main"
+
+[tool.poetry]
+packages = [
+    {include = "featherweather", from = "src"},
+    {include = "scripts"},
+]
+
+[tool.poetry.group.dev.dependencies]
+coverage = "^7.6"
+pytest = "^8.3"
+pytest-mock = "^3.14"
+pylint = "^3.3"
+black = "^24.10"
+isort = "^5.13"
+flake8 = "^7.1"
+pytest-cov = "^6.0"
+pytest-asyncio = "^0.24"
+# ESP32 firmware flashing
+esptool = "^4.7"
+# CircuitPython library manager (install/update libs on device)
+circup = "^2.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["src/featherweather"]
+branch = true
+data_file = "reports/.coverage"
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+
+[tool.coverage.html]
+directory = "reports/htmlcov"
+
+[tool.black]
+line-length = 88
+target-version = ["py313"]
+
+[tool.isort]
+profile = "black"
+src_paths = ["src", "tests"]
+
+[tool.pylint.main]
+source-roots = ["src"]
+
+[tool.pylint.format]
+max-line-length = 88
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.13"
+include = ["src"]
+exclude = ["**/__pycache__"]
+typeCheckingMode = "basic"
+
+[tool.basedpyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.13"
+include = ["src"]
+exclude = ["**/__pycache__"]
+typeCheckingMode = "basic"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

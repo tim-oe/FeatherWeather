@@ -1,0 +1,16 @@
+# CircuitPython secrets/settings file
+# Copy this to settings.toml and fill in your values.
+# WARNING: settings.toml is gitignored — never commit real credentials.
+
+[wifi]
+ssid = "YOUR_WIFI_SSID"
+password = "YOUR_WIFI_PASSWORD"
+
+[mqtt]
+broker = "mqtt.example.com"
+port = 1883
+username = ""
+password = ""
+
+[ntp]
+timezone_offset = -6  # UTC offset in hours (e.g. -6 for CST)
