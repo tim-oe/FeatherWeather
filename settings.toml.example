@@ -2,15 +2,23 @@
 # Copy this to settings.toml and fill in your values.
 # WARNING: settings.toml is gitignored — never commit real credentials.
 
-[wifi]
-ssid = "YOUR_WIFI_SSID"
-password = "YOUR_WIFI_PASSWORD"
+WIFI_SSID = "YOUR_WIFI_SSID"
+WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
 
-[mqtt]
-broker = "mqtt.example.com"
-port = 1883
-username = ""
-password = ""
+MQTT_BROKER = "mqtt.example.com"
+MQTT_PORT = 1883
+MQTT_USERNAME = ""
+MQTT_PASSWORD = ""
+MQTT_TOPIC = "featherweather/data"
 
-[ntp]
-timezone_offset = -6  # UTC offset in hours (e.g. -6 for CST)
+NTP_TIMEZONE_OFFSET = -6  # UTC offset in hours (e.g. -6 for CST)
+
+# Sensor polling
+READ_INTERVAL_MINUTES = 5
+
+# UART baud rates
+GPS_BAUD = 9600
+RS485_BAUD = 9600
+
+# RS485 Modbus read timeout in seconds (as integer milliseconds for TOML compat)
+RS485_TIMEOUT_MS = 500

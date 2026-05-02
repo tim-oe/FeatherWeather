@@ -32,6 +32,7 @@ Modbus addresses (reprogram conflicting sensors before first use):
 """
 
 import asyncio
+import os
 
 import adafruit_pcf8523
 import board
@@ -51,13 +52,13 @@ from featherweather.sensors.wind_speed.wind_speed_reader import WindSpeedReader
 # Configuration
 # ---------------------------------------------------------------------------
 
-READ_INTERVAL_MINUTES: int = 5
+READ_INTERVAL_MINUTES: int = int(os.getenv("READ_INTERVAL_MINUTES") or 5)
 
 _GPS_UPDATE_INTERVAL_S: float = 0.2   # poll GPS UART at 5 Hz
-_GPS_BAUD: int = 9600
+_GPS_BAUD: int = int(os.getenv("GPS_BAUD") or 9600)
 
-_RS485_BAUD: int = 9600
-_RS485_TIMEOUT_S: float = 0.5
+_RS485_BAUD: int = int(os.getenv("RS485_BAUD") or 9600)
+_RS485_TIMEOUT_S: float = int(os.getenv("RS485_TIMEOUT_MS") or 500) / 1000
 
 # Modbus slave addresses — change if you have reassigned them
 _WIND_DIR_ADDR: int = 0x02

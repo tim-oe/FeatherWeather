@@ -89,12 +89,12 @@ class AirQualityReader:
                 continue
 
             data = AirQualityData()
-            data.pm_1_0_conctrt_std = buf[4] << 8 | buf[5]
-            data.pm_2_5_conctrt_std = buf[6] << 8 | buf[7]
-            data.pm_10_conctrt_std = buf[8] << 8 | buf[9]
-            data.pm_1_0_conctrt_atmosph = buf[10] << 8 | buf[11]
-            data.pm_2_5_conctrt_atmosph = buf[12] << 8 | buf[13]
-            data.pm_10_conctrt_atmosph = buf[14] << 8 | buf[15]
+            data.pm_1_0_std = buf[4] << 8 | buf[5]
+            data.pm_2_5_std = buf[6] << 8 | buf[7]
+            data.pm_10_std = buf[8] << 8 | buf[9]
+            data.pm_1_0_atm = buf[10] << 8 | buf[11]
+            data.pm_2_5_atm = buf[12] << 8 | buf[13]
+            data.pm_10_atm = buf[14] << 8 | buf[15]
 
             if data.is_high(_CEILING) and attempt < self._retry - 1:
                 print(
@@ -122,10 +122,10 @@ class AirQualityReader:
             return None
 
         data = AirQualityData()
-        data.pm_1_0_conctrt_std = buf[4] << 8 | buf[5]
-        data.pm_2_5_conctrt_std = buf[6] << 8 | buf[7]
-        data.pm_10_conctrt_std = buf[8] << 8 | buf[9]
-        data.pm_1_0_conctrt_atmosph = buf[10] << 8 | buf[11]
-        data.pm_2_5_conctrt_atmosph = buf[12] << 8 | buf[13]
-        data.pm_10_conctrt_atmosph = buf[14] << 8 | buf[15]
+        data.pm_1_0_std = buf[4] << 8 | buf[5]
+        data.pm_2_5_std = buf[6] << 8 | buf[7]
+        data.pm_10_std = buf[8] << 8 | buf[9]
+        data.pm_1_0_atm = buf[10] << 8 | buf[11]
+        data.pm_2_5_atm = buf[12] << 8 | buf[13]
+        data.pm_10_atm = buf[14] << 8 | buf[15]
         return data
