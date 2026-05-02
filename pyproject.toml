@@ -22,6 +22,7 @@ dependencies = [
     "adafruit-circuitpython-bmp3xx (>=1.3.0,<2.0.0)",
     # SHTC3 [4636] - Temperature + humidity over I2C (STEMMA QT, address 0x70)
     "adafruit-circuitpython-shtc3 (>=1.1.0,<2.0.0)",
+    "rshell (>=0.0.36,<0.0.37)",
 ]
 
 [tool.poetry.dependencies]

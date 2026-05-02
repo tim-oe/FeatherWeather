@@ -33,3 +33,6 @@ reports/
 /sd/
 buffer.jsonl
 sending.jsonl
+
+# bin files for firmware flashing
+*.bin
