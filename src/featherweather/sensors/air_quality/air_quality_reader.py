@@ -29,7 +29,7 @@ _I2C_ADDR: int = 0x40
 _SELECT_CMD: bytes = bytes([0x88])
 _DATA_LEN: int = 29
 _DEFAULT_RETRY: int = 5
-_DEFAULT_WAIT_SEC: float = 0.1
+_DEFAULT_WAIT_SEC: float = 0.2   # 200 ms — HM3301 needs time between cmd and read
 _CEILING: int = 500
 
 

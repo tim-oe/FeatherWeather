@@ -65,8 +65,10 @@ poetry install
 
 ```bash
 cp settings.toml.example settings.toml
-# edit settings.toml with your WiFi credentials
+# edit settings.toml: WiFi, MQTT, sensor timings, etc.
 ```
+
+For WiFi-assisted workflows (`circup-install`, `deploy`), set **`ESP32_IP`** to your board's address on the LAN and **`CIRCUITPY_WEB_API_PASSWORD`** to match the CircuitPython WiFi / Web Workflow password you configured on the device (see [CircuitPython workflows](https://docs.circuitpython.org/en/latest/docs/workflows.html)). Empty password skips the `--password` flag for `circup-install`; `deploy` still sends Basic Auth and may fail if the device requires a password.
 
 ### Flash CircuitPython firmware
 
@@ -78,8 +80,21 @@ poetry run esptool --chip esp32 --port /dev/ttyUSB0 write_flash -z 0x0 adafruit-
 
 ### Install CircuitPython libraries on device
 
+**WiFi (`circup` against the device's Web Workflow)**
+
+After the board has joined Wi‑Fi with Web Workflow enabled, install Adafruit bundles listed in **`pyproject.toml`** using the IP and optional API password from **`settings.toml`**:
+
 ```bash
-# After flashing, install the required libs via circup:
+poetry run circup-install
+```
+
+This runs `circup install` for each `adafruit-circuitpython-*` dependency (host-only packages like Blinka/rshell are skipped). Override with **`--host`** / **`--password`** is not wired in this script—it always reads **`ESP32_IP`** and **`CIRCUITPY_WEB_API_PASSWORD`** from `settings.toml`.
+
+**USB mass storage**
+
+Alternatively, attach the CIRCUITPY drive and install manually:
+
+```bash
 poetry run circup --path /media/$USER/CIRCUITPY install adafruit_gps adafruit_pcf8523 adafruit_sdcard neopixel
 ```
 
@@ -98,6 +113,8 @@ poetry run format    # auto-fix with isort + black
 poetry run test      # pytest with coverage → reports/htmlcov/
 ```
 
+After tests pass locally, **`poetry run deploy`** uploads firmware sources over Wi‑Fi (see Deployment).
+
 ### Tool Reference
 
 | Tool | Version | Purpose |
@@ -111,9 +128,28 @@ poetry run test      # pytest with coverage → reports/htmlcov/
 | `esptool` | ^4.7 | Flash ESP32 firmware |
 | `circup` | ^2.0 | Manage CircuitPython libs on device |
 
+### Convenience scripts (`pyproject.toml`)
+
+| Entry point | Runs |
+|-------------|------|
+| `poetry run circup-install` | Reads `pyproject.toml` + `settings.toml`; runs **`circup --host`** (and **`--password`** if set) to install CP libraries |
+| `poetry run deploy` | Runs **`pytest`** on `tests/`; on success uploads **`code.py`** and **`src/featherweather/`** → `lib/featherweather/` via HTTP PUT to **`http://<ESP32_IP>/fs/...`** (Web Workflow; uses **`CIRCUITPY_WEB_API_PASSWORD`** for Basic Auth) |
+
+`poetry run deploy --skip-tests` uploads without running tests (use sparingly).
+
 ## Deployment
 
-### Deploy to device
+### Deploy over Wi‑Fi (`deploy`)
+
+Requires Web Workflow enabled, **`ESP32_IP`** and **`CIRCUITPY_WEB_API_PASSWORD`** in `settings.toml` (password must match the device if protection is enabled).
+
+```bash
+poetry run deploy
+```
+
+This runs **`pytest tests/ -v --tb=short`** first (no HTML coverage report; use `poetry run test` for coverage). After a clean run it PUTs **`code.py`** and every **`*.py`** under **`src/featherweather/`** to **`/fs/code.py`** and **`/fs/lib/featherweather/...`** on the board.
+
+### Deploy via USB mass storage
 
 ```bash
 # Copy the package to the device library folder
@@ -169,7 +205,11 @@ src/featherweather/
     └── rs485/          # shared Modbus RTU master used by all RS485 sensors
 tests/
 scripts/
+├── circup_install.py   # CP libs from pyproject.toml → circup over Wi‑Fi
+├── deploy.py           # test then upload code.py + featherweather via Web Workflow
 ├── lint.py             # isort + black + flake8 runner
+├── read_rs485_sensor.py  # host Modbus sanity check (USB-RS485)
+├── set_modbus_address.py
 └── test.py             # pytest + coverage runner
 settings.toml.example   # WiFi / secrets template (copy → settings.toml)
 ```

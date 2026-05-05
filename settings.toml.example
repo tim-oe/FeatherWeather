@@ -2,8 +2,12 @@
 # Copy this to settings.toml and fill in your values.
 # WARNING: settings.toml is gitignored — never commit real credentials.
 
-WIFI_SSID = "YOUR_WIFI_SSID"
-WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
+ESP32_IP=""
+
+# for CP to auto connect to network
+CIRCUITPY_WIFI_SSID=""
+CIRCUITPY_WIFI_PASSWORD=""
+CIRCUITPY_WEB_API_PASSWORD=""
 
 MQTT_BROKER = "mqtt.example.com"
 MQTT_PORT = 1883

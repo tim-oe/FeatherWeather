@@ -20,7 +20,7 @@ Parallelism note:
 Pin assignments (adjust to match your wiring):
     I2C  SCL / SDA        board.SCL / board.SDA   (STEMMA QT / FeatherWing)
     SPI  SCK / MOSI / MISO board.SCK / MOSI / MISO (SD card on Adalogger)
-    SPI  CS               board.D10               (SD chip-select)
+    SPI  CS               board.D33               (SD chip-select; Feather "D10" slot → GPIO33)
     UART1 TX / RX         board.TX / board.RX     (GPS FeatherWing, 9600 baud)
     UART2 TX / RX         board.A0 / board.A1     (RS485 MAX3485, 9600 baud)
     DE   MAX3485 DE/~RE   board.D5                (RS485 direction control)
@@ -34,7 +34,7 @@ Modbus addresses (reprogram conflicting sensors before first use):
 import asyncio
 import os
 
-import adafruit_pcf8523
+import adafruit_pcf8523.pcf8523 as _pcf8523_mod
 import board
 import busio
 import digitalio
@@ -47,12 +47,14 @@ from featherweather.sensors.rainfall.rainfall_reader import RainfallReader
 from featherweather.sensors.temp_humidity.temp_humidity_reader import TempHumidityReader
 from featherweather.sensors.wind_direction.wind_direction_reader import WindDirectionReader
 from featherweather.sensors.wind_speed.wind_speed_reader import WindSpeedReader
+from featherweather.rtc.rtc_sync import sync_rtc_from_ntp
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 READ_INTERVAL_MINUTES: int = int(os.getenv("READ_INTERVAL_MINUTES") or 5)
+_NTP_TZ_OFFSET: int = int(os.getenv("NTP_TIMEZONE_OFFSET") or 0)
 
 _GPS_UPDATE_INTERVAL_S: float = 0.2   # poll GPS UART at 5 Hz
 _GPS_BAUD: int = int(os.getenv("GPS_BAUD") or 9600)
@@ -77,7 +79,7 @@ _gps_altitude_m: float | None = None
 # ---------------------------------------------------------------------------
 
 
-def _seconds_until_next_interval(rtc: adafruit_pcf8523.PCF8523) -> float:
+def _seconds_until_next_interval(rtc: _pcf8523_mod.PCF8523) -> float:
     """Return seconds until the next READ_INTERVAL_MINUTES boundary.
 
     Examples (5-minute interval):
@@ -166,7 +168,7 @@ async def gps_task(gps: GpsReader) -> None:
 
 
 async def sensor_cycle_task(
-    rtc: adafruit_pcf8523.PCF8523,
+    rtc: _pcf8523_mod.PCF8523,
     baro: BarometricReader,
     temp_hum: TempHumidityReader,
     aq: AirQualityReader,
@@ -215,8 +217,9 @@ async def main() -> None:
     # Shared I2C bus (STEMMA QT / FeatherWing headers)
     i2c = busio.I2C(board.SCL, board.SDA)
 
-    # RTC — PCF8523 on Adalogger FeatherWing
-    rtc = adafruit_pcf8523.PCF8523(i2c)
+    # RTC — PCF8523 on Adalogger FeatherWing; sync time from NTP on every boot
+    rtc = _pcf8523_mod.PCF8523(i2c)
+    sync_rtc_from_ntp(rtc, tz_offset=_NTP_TZ_OFFSET)
 
     # GPS — Ultimate GPS FeatherWing on UART1
     gps_uart = busio.UART(board.TX, board.RX, baudrate=_GPS_BAUD, timeout=0.1)
