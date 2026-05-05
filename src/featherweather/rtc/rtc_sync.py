@@ -63,7 +63,13 @@ def sync_rtc_from_ntp(rtc, tz_offset: int = 0) -> bool:
             tz_offset=tz_offset,
             cache_seconds=3600,
         )
-        rtc.datetime = ntp.datetime
+        ntp_time = ntp.datetime
+        # Update the hardware RTC
+        rtc.datetime = ntp_time
+        # Also update CircuitPython's internal system clock so FAT file
+        # timestamps match wall-clock time from the first write onwards.
+        import rtc as _cp_rtc  # noqa: PLC0415
+        _cp_rtc.RTC().datetime = ntp_time
         dt = rtc.datetime
         print(
             f"[NTP] RTC synced → "
