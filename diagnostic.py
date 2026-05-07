@@ -184,12 +184,20 @@ def _verify_sd() -> bool:
 def _check_disk() -> None:
     """Report filesystem usage for / and /sd.
 
-    os.statvfs() path resolution is broken for non-root mounts on CircuitPython
-    ESP32 builds — every path resolves to the root VFS.  For /sd we therefore
-    get the physical capacity directly from sdcard.count() (available because
-    _verify_sd() mounted the card in this VM and kept the SDCard object alive),
-    and compute used bytes by walking the directory tree with os.listdir + os.stat,
-    which use a different (correct) path resolver.
+    Internal flash (/): os.statvfs("/") is used directly — this works correctly
+    and reports the CIRCUITPY FAT partition (~3.9 MB of the 8 MB SPI flash; the
+    remainder is consumed by the CircuitPython firmware partition).
+
+    SD card (/sd): total capacity comes from sdcard.count() * 512, a direct
+    block-device read that bypasses the VFS layer entirely and returns the true
+    physical size.  Used bytes are computed by walking the tree with os.listdir
+    + os.stat; free is derived as total - used (approximate — ignores FAT
+    metadata overhead such as the FAT tables and cluster slack).
+
+    The SDCard object is kept alive by _verify_sd() which mounts the card in
+    this code.py VM.  (Mounting in boot.py does not help: boot.py and code.py
+    run in separate, consecutive Python VMs, so any mount made in boot.py is
+    torn down before code.py starts.)
     """
     _section("Disk Usage")
     import os  # noqa: PLC0415
@@ -241,28 +249,30 @@ def _check_disk() -> None:
         _log(f"  /  unavailable ({exc})")
 
     # --- SD card (/sd) ---
-    # statvfs("/sd") is broken on CircuitPython 10 ESP32 (all paths resolve to
-    # root VFS), so total capacity comes from sdcard.count() * 512 — a direct
-    # block-device read that bypasses the broken VFS path resolver.
+    # os.statvfs("/sd") is authoritative here because the mount is owned by
+    # this code.py VM.  sdcard.count()*512 reads the CSD register which
+    # misreports capacity on SDXC (>32 GB) cards in SPI mode and is not used.
     _log("  SD card  /sd")
     if not _sdcard:
         _log("    unavailable — SD card was not mounted (see SD card section above)")
         return
 
+    sd_total = sd_free = None
     try:
-        sd_total = _sdcard.count() * 512
+        st = os.statvfs("/sd")
+        blk = st[1]
+        sd_total = blk * st[2]
+        sd_free  = blk * st[4]
     except Exception as exc:  # noqa: BLE001
-        _log(f"    could not read SD capacity: {exc}")
-        sd_total = None
+        _log(f"    statvfs /sd unavailable: {exc}")
 
     try:
         file_count, dir_count, used_bytes = _walk_used("/sd")
         if sd_total:
-            free_bytes = sd_total - used_bytes if used_bytes < sd_total else 0
             pct = used_bytes / sd_total * 100
             _log(f"    total  : {_fmt_bytes(sd_total)}")
             _log(f"    used   : {_fmt_bytes(used_bytes)}  ({pct:.1f}%)")
-            _log(f"    free   : {_fmt_bytes(free_bytes)}")
+            _log(f"    free   : {_fmt_bytes(sd_free)}")
         else:
             _log(f"    used   : {_fmt_bytes(used_bytes)}  (visible files only; total unavailable)")
         _log(f"    files  : {file_count}  dirs : {dir_count}")
@@ -592,12 +602,15 @@ def _check_gps():
             if gps.timestamp_utc
             else "n/a"
         )
+        lat = gps.latitude  if gps.latitude  is not None else 0.0
+        lon = gps.longitude if gps.longitude is not None else 0.0
+        alt = gps.altitude_m if gps.altitude_m is not None else 0.0
         _result(
             "GPS fix",
             True,
             (
-                f"lat={gps.latitude:.6f}  lon={gps.longitude:.6f}"
-                f"  alt={gps.altitude_m:.1f}m  sats={gps.satellites}  utc={ts}"
+                f"lat={lat:.6f}  lon={lon:.6f}"
+                f"  alt={alt:.1f}m  sats={gps.satellites}  utc={ts}"
             ),
         )
     else:
