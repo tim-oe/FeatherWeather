@@ -1,20 +1,43 @@
-"""Run tests, then deploy code to the CircuitPython device over WiFi.
+"""Run tests, then deploy code to the CircuitPython device.
 
-Uses the CircuitPython Web Workflow REST API (HTTP PUT) to upload files:
-    code.py              → http://<ESP32_IP>/fs/code.py
-    src/featherweather/  → http://<ESP32_IP>/fs/lib/featherweather/
+Three transport modes are supported:
 
-The CIRCUITPY_WEB_API_PASSWORD from settings.toml is sent as HTTP Basic Auth
-(empty username, password as configured on the device).
+  WiFi (default)
+    Uses the CircuitPython Web Workflow REST API (HTTP PUT):
+        code.py              → http://<ESP32_IP>/fs/code.py
+        src/featherweather/  → http://<ESP32_IP>/fs/lib/featherweather/
+    The CIRCUITPY_WEB_API_PASSWORD from settings.toml is sent as HTTP Basic
+    Auth (empty username, password as configured on the device).
+
+  Serial / rshell  (--serial)
+    Transfers files over the USB-serial port using rshell.
+    Use when WiFi is unavailable or the device is in a broken state.
+    The Feather ESP32 V2 uses a CH340 USB-to-serial chip; it never exposes a
+    CIRCUITPY mass-storage drive, so this is the correct USB recovery path.
+    Requires: poetry run rshell (already a project dependency).
+
+  USB mass storage  (--usb / --usb-path)
+    Copies files directly to a CIRCUITPY drive mounted as a filesystem.
+    Only relevant for boards with native USB (e.g. ESP32-S2 / S3).
+    Not applicable to the Feather ESP32 V2.
 
 Usage:
     poetry run deploy
     python scripts/deploy.py
-    python scripts/deploy.py --skip-tests   # deploy without running tests
-    python scripts/deploy.py --diagnostic   # deploy diagnostic.py as code.py
+    python scripts/deploy.py --skip-tests           # skip tests before deploy
+    python scripts/deploy.py --diagnostic           # deploy diagnostic.py as code.py
+    python scripts/deploy.py --sysmon               # deploy sysmon.py as code.py
+    python scripts/deploy.py --serial               # serial deploy via rshell
+    python scripts/deploy.py --serial --diagnostic  # serial + diagnostic mode
+    python scripts/deploy.py --serial --sysmon      # serial + live monitor
+    python scripts/deploy.py --serial --port /dev/ttyACM1  # non-default port
+    python scripts/deploy.py --usb                  # USB drive deploy (ESP32-S2/S3)
+    python scripts/deploy.py --usb-path /media/you/CIRCUITPY
 """
 
 import argparse
+import getpass
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -29,8 +52,26 @@ SETTINGS_PATH = REPO_ROOT / "settings.toml"
 
 CODE_PY = REPO_ROOT / "code.py"
 DIAGNOSTIC_PY = REPO_ROOT / "diagnostic.py"
+SYSMON_PY = REPO_ROOT / "sysmon.py"
 BOOT_PY = REPO_ROOT / "boot.py"
 LIB_SRC = REPO_ROOT / "src" / "featherweather"
+
+
+def _resolve_source(mode: str) -> tuple[Path, str]:
+    """Return (source_file, label) for mode in {'normal', 'diagnostic', 'sysmon'}."""
+    if mode == "diagnostic":
+        return DIAGNOSTIC_PY, "diagnostic.py (as code.py)"
+    if mode == "sysmon":
+        return SYSMON_PY, "sysmon.py (as code.py)"
+    return CODE_PY, "code.py"
+
+
+def _mode_banner(mode: str) -> str:
+    return {
+        "diagnostic": "Mode: DIAGNOSTIC — device will run self-test on next boot",
+        "sysmon":     "Mode: SYSMON — device will stream live resource stats",
+        "normal":     "",
+    }.get(mode, "")
 
 
 # ---------------------------------------------------------------------------
@@ -119,20 +160,20 @@ def upload_file(host: str, remote_path: str, local_path: Path, auth: dict[str, s
 
 
 # ---------------------------------------------------------------------------
-# Deployment logic
+# WiFi deployment
 # ---------------------------------------------------------------------------
 
 
-def deploy(host: str, password: str, diagnostic: bool = False) -> int:
+def deploy_wifi(host: str, password: str, mode: str = "normal") -> int:
     auth = _auth_header(password)
 
-    source_file = DIAGNOSTIC_PY if diagnostic else CODE_PY
-    mode_label = "diagnostic.py (as code.py)" if diagnostic else "code.py"
+    source_file, mode_label = _resolve_source(mode)
+    banner = _mode_banner(mode)
 
     print("=" * 60)
-    print(f"Deploying to {host}")
-    if diagnostic:
-        print("Mode: DIAGNOSTIC — device will run self-test on next boot")
+    print(f"Deploying via WiFi → {host}")
+    if banner:
+        print(banner)
     print("=" * 60)
 
     # 1. Upload boot.py
@@ -155,18 +196,16 @@ def deploy(host: str, password: str, diagnostic: bool = False) -> int:
         print(f"Error: {LIB_SRC} not found", file=sys.stderr)
         return 1
 
-    # Collect all .py files and the unique directories they live in.
     py_files = sorted(LIB_SRC.rglob("*.py"))
     dirs_needed: list[str] = []
     for f in py_files:
         rel = f.relative_to(LIB_SRC)
-        parts = rel.parts[:-1]  # directory components only
+        parts = rel.parts[:-1]
         for depth in range(len(parts) + 1):
             candidate = "lib/featherweather/" + "/".join(parts[:depth])
             if candidate not in dirs_needed:
                 dirs_needed.append(candidate)
 
-    # Ensure all remote directories exist before uploading files.
     for d in dirs_needed:
         mkdir_remote(host, d, auth)
 
@@ -176,6 +215,159 @@ def deploy(host: str, password: str, diagnostic: bool = False) -> int:
         upload_file(host, remote, f, auth)
 
     print(f"\nDeploy complete — {len(py_files)} library file(s) uploaded.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Serial deployment (rshell)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
+_RSHELL_BUFFER = "512"
+
+
+def _rshell(port: str, *cmd_args: str) -> None:
+    """Run a single rshell command; raise RuntimeError on non-zero exit."""
+    argv = [
+        "rshell",
+        "--port", port,
+        "--buffer-size", _RSHELL_BUFFER,
+        *cmd_args,
+    ]
+    result = subprocess.run(argv)
+    if result.returncode != 0:
+        raise RuntimeError(f"rshell {' '.join(cmd_args)} failed (exit {result.returncode})")
+
+
+def deploy_serial(port: str, mode: str = "normal") -> int:
+    source_file, mode_label = _resolve_source(mode)
+    banner = _mode_banner(mode)
+
+    print("=" * 60)
+    print(f"Deploying via serial → {port}")
+    if banner:
+        print(banner)
+    print("=" * 60)
+
+    try:
+        # 1. settings.toml — always restored on serial deploy because a wiped
+        #    filesystem leaves it empty, breaking WiFi on the next boot.
+        if SETTINGS_PATH.exists():
+            print("\n[1/4] Uploading settings.toml ...")
+            _rshell(port, "cp", str(SETTINGS_PATH), "/pyboard/settings.toml")
+        else:
+            print("\n[1/4] settings.toml not found locally — skipping")
+
+        # 2. boot.py
+        print("\n[2/4] Uploading boot.py ...")
+        if not BOOT_PY.exists():
+            print(f"Error: {BOOT_PY} not found", file=sys.stderr)
+            return 1
+        _rshell(port, "cp", str(BOOT_PY), "/pyboard/boot.py")
+
+        # 3. code.py
+        print(f"\n[3/4] Uploading {mode_label} ...")
+        if not source_file.exists():
+            print(f"Error: {source_file} not found", file=sys.stderr)
+            return 1
+        _rshell(port, "cp", str(source_file), "/pyboard/code.py")
+
+        # 4. featherweather package
+        print("\n[4/4] Syncing featherweather package ...")
+        if not LIB_SRC.exists():
+            print(f"Error: {LIB_SRC} not found", file=sys.stderr)
+            return 1
+        _rshell(port, "rsync", str(LIB_SRC), "/pyboard/lib/featherweather")
+
+    except RuntimeError as exc:
+        print(f"\nError: {exc}", file=sys.stderr)
+        return 1
+
+    print("\nDeploy complete.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# USB deployment
+# ---------------------------------------------------------------------------
+
+_USB_CANDIDATE_ROOTS = [
+    Path("/media") / getpass.getuser() / "CIRCUITPY",
+    Path("/media/CIRCUITPY"),
+    Path("/Volumes/CIRCUITPY"),           # macOS
+    Path("D:/"),                          # Windows (common first guess)
+]
+
+
+def _find_circuitpy() -> Path | None:
+    """Return the CIRCUITPY mount point or None if not found."""
+    for p in _USB_CANDIDATE_ROOTS:
+        if p.is_dir() and (p / "boot_out.txt").exists():
+            return p
+    return None
+
+
+def deploy_usb(mount: Path | None, mode: str = "normal") -> int:
+    if mount is None:
+        mount = _find_circuitpy()
+
+    if mount is None:
+        checked = "\n  ".join(str(p) for p in _USB_CANDIDATE_ROOTS)
+        print(
+            "Error: CIRCUITPY drive not found. Checked:\n  " + checked,
+            file=sys.stderr,
+        )
+        print(
+            "Connect the device via USB and try again, or specify the mount "
+            "point with --usb-path.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not mount.is_dir():
+        print(f"Error: USB path {mount} does not exist or is not a directory.", file=sys.stderr)
+        return 1
+
+    source_file, mode_label = _resolve_source(mode)
+    banner = _mode_banner(mode)
+
+    print("=" * 60)
+    print(f"Deploying via USB → {mount}")
+    if banner:
+        print(banner)
+    print("=" * 60)
+
+    # 1. boot.py
+    print("\n[1/3] Copying boot.py ...")
+    if not BOOT_PY.exists():
+        print(f"Error: {BOOT_PY} not found", file=sys.stderr)
+        return 1
+    shutil.copy2(BOOT_PY, mount / "boot.py")
+    print(f"  copied  boot.py → {mount / 'boot.py'}")
+
+    # 2. code.py
+    print(f"\n[2/3] Copying {mode_label} ...")
+    if not source_file.exists():
+        print(f"Error: {source_file} not found", file=sys.stderr)
+        return 1
+    shutil.copy2(source_file, mount / "code.py")
+    print(f"  copied  {source_file.name} → {mount / 'code.py'}")
+
+    # 3. featherweather package → lib/featherweather/
+    print("\n[3/3] Copying featherweather package ...")
+    if not LIB_SRC.exists():
+        print(f"Error: {LIB_SRC} not found", file=sys.stderr)
+        return 1
+
+    dest_lib = mount / "lib" / "featherweather"
+    if dest_lib.exists():
+        shutil.rmtree(dest_lib)
+    shutil.copytree(LIB_SRC, dest_lib)
+
+    py_count = len(list(dest_lib.rglob("*.py")))
+    print(f"  copied  featherweather/ → {dest_lib}  ({py_count} files)")
+
+    print(f"\nDeploy complete — eject {mount} safely before unplugging.")
     return 0
 
 
@@ -191,20 +383,68 @@ def main() -> int:
         action="store_true",
         help="Deploy without running tests first",
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--diagnostic",
         action="store_true",
         help="Deploy diagnostic.py as code.py (device runs self-test on next boot)",
     )
+    mode_group.add_argument(
+        "--sysmon",
+        action="store_true",
+        help="Deploy sysmon.py as code.py (live htop-style resource monitor)",
+    )
+    parser.add_argument(
+        "--serial",
+        action="store_true",
+        help=(
+            "Deploy over USB-serial using rshell (use when WiFi is unavailable). "
+            "Required for Feather ESP32 V2 which has no USB mass-storage drive."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        metavar="PORT",
+        default=_DEFAULT_SERIAL_PORT,
+        help=f"Serial port for --serial mode (default: {_DEFAULT_SERIAL_PORT})",
+    )
+    parser.add_argument(
+        "--usb",
+        action="store_true",
+        help="Deploy over USB mass-storage CIRCUITPY drive (ESP32-S2/S3 only)",
+    )
+    parser.add_argument(
+        "--usb-path",
+        metavar="PATH",
+        help="Explicit path to the CIRCUITPY mount point (implies --usb)",
+    )
     args = parser.parse_args()
 
-    host, password = load_settings()
+    use_serial = args.serial
+    use_usb = args.usb or bool(args.usb_path)
 
-    if not args.skip_tests and not args.diagnostic:
+    if args.diagnostic:
+        mode = "diagnostic"
+    elif args.sysmon:
+        mode = "sysmon"
+    else:
+        mode = "normal"
+
+    # Tests only matter for normal-mode code.py deploys; diagnostic and sysmon
+    # are debug payloads where running the test suite first is just friction.
+    if not args.skip_tests and mode == "normal":
         if not run_tests():
             return 1
 
-    return deploy(host, password, diagnostic=args.diagnostic)
+    if use_serial:
+        return deploy_serial(args.port, mode=mode)
+
+    if use_usb:
+        mount = Path(args.usb_path) if args.usb_path else None
+        return deploy_usb(mount, mode=mode)
+
+    host, password = load_settings()
+    return deploy_wifi(host, password, mode=mode)
 
 
 if __name__ == "__main__":

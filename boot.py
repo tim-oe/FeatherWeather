@@ -1,28 +1,18 @@
 """boot.py — runs once before code.py on every boot.
 
-Mounts the Adalogger FeatherWing SD card at /sd so it is available for
-the entire session (both diagnostic.py and code.py).  Mounting here
-rather than inside code.py means the card stays accessible even after
-code.py finishes and the device drops to the REPL.
+Seeds CircuitPython's internal system clock from the PCF8523 RTC so that
+FAT file timestamps are correct from the first write.
 
-Also seeds CircuitPython's internal system clock from the PCF8523 RTC
-so that FAT file timestamps are correct from the first write.
-
-Pin assignments (ESP32 Feather V2):
-    SPI  SCK / MOSI / MISO   board.SCK / MOSI / MISO
-    SPI  CS                  board.D33  (Feather "D10" slot → GPIO33)
-    I2C  SCL / SDA           board.SCL / board.SDA  (PCF8523)
+SD card mounting has intentionally been moved to code.py / diagnostic.py.
+boot.py and code.py run in separate, consecutive Python VMs; any
+storage.mount() call here is torn down before code.py starts, so the SD
+card must be mounted by user code itself.
 """
 
 import board
 import busio
-import digitalio
 import rtc as _cp_rtc
-import adafruit_sdcard
 import adafruit_pcf8523.pcf8523 as _pcf8523
-import storage
-
-_SD_CS_PIN = board.D33
 
 
 def _sync_system_clock() -> None:
@@ -41,19 +31,4 @@ def _sync_system_clock() -> None:
         print(f"boot: system clock sync failed: {exc}")
 
 
-def _mount_sd() -> bool:
-    try:
-        spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
-        cs = digitalio.DigitalInOut(_SD_CS_PIN)
-        sdcard = adafruit_sdcard.SDCard(spi, cs)
-        vfs = storage.VfsFat(sdcard)
-        storage.mount(vfs, "/sd")
-        print("boot: SD card mounted at /sd")
-        return True
-    except Exception as exc:  # noqa: BLE001
-        print(f"boot: SD card mount failed: {exc}")
-        return False
-
-
 _sync_system_clock()
-_mount_sd()

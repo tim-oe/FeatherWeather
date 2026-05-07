@@ -19,6 +19,9 @@ Hardware checked
 Output
 ------
     Serial console              live progress with [PASS] / [FAIL] per device
+    NeoPixel                    green flash = pass, red flash = fail per test;
+                                summary flash: green×N (all pass), yellow×N
+                                (<50% fail), red×N (≥50% fail)
     /sd/diag_YYYYMMDD_HHMMSS.txt  persisted report (diag_unknown.txt if RTC fails)
 """
 
@@ -40,7 +43,10 @@ import busio
 # Configuration
 # ---------------------------------------------------------------------------
 
-_SD_CS_PIN = board.D33    # defined in boot.py — kept here for reference only
+_SD_CS_PIN = board.D33
+
+# Set by _verify_sd() so _check_disk() can call sdcard.count() for true capacity.
+_sdcard = None
 _GPS_BAUD: int = 9600
 _GPS_NMEA_CHECK_S: float = 5.0    # seconds to wait for the first NMEA sentence
 _GPS_FIX_TIMEOUT_S: float = 30.0  # seconds to attempt a GPS fix
@@ -53,6 +59,53 @@ _KNOWN_I2C_ADDRS: dict = {
     0x70: "SHTC3 (Temp/Humidity)",
     0x77: "BMP390 (Barometric)",
 }
+
+# ---------------------------------------------------------------------------
+# NeoPixel — single built-in pixel for visual pass/fail feedback
+# ---------------------------------------------------------------------------
+
+_GREEN  = (0, 50, 0)
+_RED    = (50, 0, 0)
+_YELLOW = (50, 50, 0)
+_OFF    = (0, 0, 0)
+
+_pixel = None
+try:
+    import neopixel  # noqa: PLC0415
+    _pixel = neopixel.NeoPixel(board.NEOPIXEL, 1, brightness=0.2, auto_write=True)
+    _pixel[0] = _OFF
+except Exception:  # noqa: BLE001
+    pass  # NeoPixel unavailable — visual feedback silently skipped
+
+
+def _flash(color, count: int = 1, on_ms: int = 200, off_ms: int = 100) -> None:
+    """Flash the built-in NeoPixel *count* times in *color*."""
+    if _pixel is None:
+        return
+    for _ in range(count):
+        _pixel[0] = color
+        time.sleep(on_ms / 1000)
+        _pixel[0] = _OFF
+        time.sleep(off_ms / 1000)
+
+# ---------------------------------------------------------------------------
+# Result tracking — updated in the main flow after each top-level test
+# ---------------------------------------------------------------------------
+
+_pass_count: int = 0
+_fail_count: int = 0
+
+
+def _track(ok: bool) -> None:
+    """Record a top-level test result and flash the NeoPixel accordingly."""
+    global _pass_count, _fail_count
+    if ok:
+        _pass_count += 1
+        _flash(_GREEN)
+    else:
+        _fail_count += 1
+        _flash(_RED)
+
 
 # ---------------------------------------------------------------------------
 # Report buffer — all output is echoed to serial and buffered for SD write
@@ -85,25 +138,274 @@ def _result(label: str, ok: bool, detail: str = "") -> None:
 
 
 def _verify_sd() -> bool:
+    """Mount the SD card and confirm it is writable.
+
+    boot.py no longer mounts the SD card (the mount is torn down between the
+    boot.py and code.py VMs).  We mount it here so the card stays available
+    for the rest of this script, and we keep a reference to the SDCard object
+    so _check_disk() can call sdcard.count() for the true physical capacity.
+    """
+    global _sdcard  # noqa: PLW0603
     _section("Adalogger SD Card")
-    # boot.py mounts the SD card before code.py runs.
-    # Verify by checking /sd is in the root listing and writing a sentinel file.
     try:
-        import os  # noqa: PLC0415
-        if "sd" not in os.listdir("/"):
-            _result("SD card mount", False, "/sd not present — check boot.py")
-            return False
-        # Write a sentinel file to confirm the card is writable
-        sentinel = "/sd/mounted.txt"
-        f = open(sentinel, "w")
-        f.write("SD card mounted OK\n")
-        f.flush()
-        f.close()
-        _result("SD card mount", True, "mounted at /sd, write verified")
+        import os            # noqa: PLC0415
+        import storage       # noqa: PLC0415
+        import digitalio     # noqa: PLC0415
+        import adafruit_sdcard as _asc  # noqa: PLC0415
+
+        spi    = busio.SPI(board.SCK, board.MOSI, board.MISO)
+        cs     = digitalio.DigitalInOut(_SD_CS_PIN)
+        sdcard = _asc.SDCard(spi, cs)
+        vfs    = storage.VfsFat(sdcard)
+        storage.mount(vfs, "/sd")
+        _sdcard = sdcard  # keep alive for count() in _check_disk()
+
+        _result("SD card mount", True, "mounted at /sd")
+
+        # Confirm card is writable
+        with open("/sd/mounted.txt", "w") as f:
+            f.write("SD card mounted OK\n")
+            f.flush()
+        _result("SD card write", True)
+
+        entries = os.listdir("/sd")
+        _log(f"    /sd contents: {entries}")
         return True
     except Exception as exc:  # noqa: BLE001
-        _result("SD card mount", False, str(exc))
+        _result("SD card", False, str(exc))
         return False
+
+
+# ---------------------------------------------------------------------------
+# Disk metrics — os.statvfs() equivalent of df -h
+# ---------------------------------------------------------------------------
+
+
+def _check_disk() -> None:
+    """Report filesystem usage for / and /sd.
+
+    os.statvfs() path resolution is broken for non-root mounts on CircuitPython
+    ESP32 builds — every path resolves to the root VFS.  For /sd we therefore
+    get the physical capacity directly from sdcard.count() (available because
+    _verify_sd() mounted the card in this VM and kept the SDCard object alive),
+    and compute used bytes by walking the directory tree with os.listdir + os.stat,
+    which use a different (correct) path resolver.
+    """
+    _section("Disk Usage")
+    import os  # noqa: PLC0415
+
+    def _fmt_bytes(n: float) -> str:
+        for unit in ("B", "KB", "MB", "GB"):
+            if n < 1024:
+                return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} TB"
+
+    def _walk_used(path: str) -> tuple:
+        """Return (file_count, dir_count, total_bytes) for path recursively."""
+        files = dirs = nbytes = 0
+        try:
+            entries = os.listdir(path)
+        except Exception:  # noqa: BLE001
+            return files, dirs, nbytes
+        for name in entries:
+            sub = path + "/" + name if path != "/" else "/" + name
+            try:
+                st = os.stat(sub)
+                if st[0] & 0x4000:
+                    dirs += 1
+                    fc, dc, nb = _walk_used(sub)
+                    files += fc
+                    dirs  += dc
+                    nbytes += nb
+                else:
+                    files += 1
+                    nbytes += st[6]
+            except Exception:  # noqa: BLE001
+                pass
+        return files, dirs, nbytes
+
+    # --- Internal flash (/) ---
+    try:
+        st    = os.statvfs("/")
+        block = st[1]
+        total = block * st[2]
+        free  = block * st[4]
+        used  = total - free
+        pct   = (used / total * 100) if total else 0.0
+        _log("  Internal flash  /")
+        _log(f"    total : {_fmt_bytes(total)}")
+        _log(f"    used  : {_fmt_bytes(used)}  ({pct:.0f}%)")
+        _log(f"    free  : {_fmt_bytes(free)}")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"  /  unavailable ({exc})")
+
+    # --- SD card (/sd) ---
+    # statvfs("/sd") is broken on CircuitPython 10 ESP32 (all paths resolve to
+    # root VFS), so total capacity comes from sdcard.count() * 512 — a direct
+    # block-device read that bypasses the broken VFS path resolver.
+    _log("  SD card  /sd")
+    if not _sdcard:
+        _log("    unavailable — SD card was not mounted (see SD card section above)")
+        return
+
+    try:
+        sd_total = _sdcard.count() * 512
+    except Exception as exc:  # noqa: BLE001
+        _log(f"    could not read SD capacity: {exc}")
+        sd_total = None
+
+    try:
+        file_count, dir_count, used_bytes = _walk_used("/sd")
+        if sd_total:
+            free_bytes = sd_total - used_bytes if used_bytes < sd_total else 0
+            pct = used_bytes / sd_total * 100
+            _log(f"    total  : {_fmt_bytes(sd_total)}")
+            _log(f"    used   : {_fmt_bytes(used_bytes)}  ({pct:.1f}%)")
+            _log(f"    free   : {_fmt_bytes(free_bytes)}")
+        else:
+            _log(f"    used   : {_fmt_bytes(used_bytes)}  (visible files only; total unavailable)")
+        _log(f"    files  : {file_count}  dirs : {dir_count}")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"    unavailable ({exc})")
+
+
+# ---------------------------------------------------------------------------
+# System resources — programmatic htop-style snapshot
+# ---------------------------------------------------------------------------
+
+
+def _check_system() -> None:
+    """One-shot snapshot of CPU, memory, runtime, network, firmware.
+
+    CircuitPython on ESP32 doesn't expose the FreeRTOS task table, per-core
+    CPU counters, or heap_caps_get_info from the underlying ESP-IDF, so this
+    is the maximum useful resolution available from pure Python.
+    """
+    _section("System Resources")
+    import gc                  # noqa: PLC0415
+    import os                  # noqa: PLC0415
+
+    # --- Firmware ---
+    try:
+        u = os.uname()
+        _log("  Firmware")
+        _log(f"    sysname    : {u.sysname}")
+        _log(f"    release    : {u.release}")
+        _log(f"    version    : {u.version}")
+        _log(f"    machine    : {u.machine}")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"  Firmware info unavailable ({exc})")
+
+    # --- CPU ---
+    def _fmt(val, spec: str, suffix: str = "") -> str:
+        # Some CP builds return None instead of raising for unsupported props.
+        if val is None:
+            return "n/a"
+        try:
+            return f"{val:{spec}}" + suffix
+        except (TypeError, ValueError):
+            return "n/a"
+
+    def _safe_get(obj, attr):
+        try:
+            return getattr(obj, attr)
+        except (AttributeError, NotImplementedError, RuntimeError):
+            return None
+
+    try:
+        import microcontroller  # noqa: PLC0415
+        cpu = microcontroller.cpu
+        freq_hz = _safe_get(cpu, "frequency")
+        temp_c  = _safe_get(cpu, "temperature")
+        volts   = _safe_get(cpu, "voltage")
+        reset   = _safe_get(cpu, "reset_reason")
+
+        _log("  CPU")
+        _log(f"    frequency  : {_fmt(freq_hz / 1_000_000 if freq_hz else None, '.0f', ' MHz')}")
+        _log(f"    temperature: {_fmt(temp_c, '.1f', ' C')}")
+        _log(f"    voltage    : {_fmt(volts,  '.2f', ' V')}")
+        if reset is not None:
+            _log(f"    reset cause: {reset}")
+        try:
+            nvm_len = len(microcontroller.nvm) if microcontroller.nvm is not None else 0
+            _log(f"    NVM bytes  : {nvm_len}")
+        except (AttributeError, TypeError):
+            pass
+    except Exception as exc:  # noqa: BLE001
+        _log(f"  CPU info unavailable ({exc})")
+
+    # --- Memory (heap) ---
+    # Time the gc.collect() call as a proxy for "load":  longer pauses imply a
+    # more fragmented or heavily allocated heap.
+    t0 = time.monotonic_ns()
+    gc.collect()
+    gc_ms = (time.monotonic_ns() - t0) / 1_000_000
+    free  = gc.mem_free()
+    alloc = gc.mem_alloc()
+    total = free + alloc
+    pct   = (alloc / total * 100) if total else 0.0
+    _log("  Memory (heap)")
+    _log(f"    total      : {total // 1024} KB")
+    _log(f"    allocated  : {alloc // 1024} KB ({pct:.0f}%)")
+    _log(f"    free       : {free // 1024} KB")
+    _log(f"    gc.collect : {gc_ms:.1f} ms (load proxy)")
+
+    # --- Runtime ---
+    try:
+        import supervisor  # noqa: PLC0415
+        rt = supervisor.runtime
+        _log("  Runtime")
+        _log(f"    uptime     : {time.monotonic():.0f}s")
+        try:
+            _log(f"    run_reason : {rt.run_reason}")
+        except AttributeError:
+            pass
+        try:
+            _log(f"    safe_mode  : {rt.safe_mode_reason}")
+        except AttributeError:
+            pass
+        try:
+            _log(f"    usb conn   : {rt.usb_connected}")
+            _log(f"    serial conn: {rt.serial_connected}")
+        except AttributeError:
+            pass
+    except Exception as exc:  # noqa: BLE001
+        _log(f"  Runtime info unavailable ({exc})")
+
+    # --- Network (WiFi) ---
+    try:
+        import wifi  # noqa: PLC0415
+        radio = wifi.radio
+        _log("  Network (WiFi)")
+        if radio.connected:
+            _log(f"    ip         : {radio.ipv4_address}")
+            try:
+                mac = ":".join(f"{b:02X}" for b in radio.mac_address)
+                _log(f"    mac        : {mac}")
+            except (AttributeError, TypeError):
+                pass
+            try:
+                _log(f"    hostname   : {radio.hostname}")
+            except AttributeError:
+                pass
+            try:
+                _log(f"    tx_power   : {radio.tx_power} dBm")
+            except (AttributeError, NotImplementedError):
+                pass
+            try:
+                ap = radio.ap_info
+                if ap:
+                    _log(f"    ssid       : {ap.ssid}")
+                    _log(f"    rssi       : {ap.rssi} dBm  ch={ap.channel}")
+            except (AttributeError, NotImplementedError):
+                pass
+        else:
+            _log("    not connected")
+    except ImportError:
+        _log("  Network: wifi module unavailable")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"  Network info unavailable ({exc})")
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +428,26 @@ def _check_rtc(i2c):
     except Exception as exc:  # noqa: BLE001
         _result("PCF8523 init + read", False, str(exc))
         return None
+
+
+# ---------------------------------------------------------------------------
+# NTP time sync
+# ---------------------------------------------------------------------------
+
+
+def _check_ntp(rtc) -> bool:
+    _section("NTP Time Sync")
+    if rtc is None:
+        _result("NTP sync", False, "skipped — RTC not available")
+        return False
+    try:
+        from featherweather.rtc.rtc_sync import sync_rtc_from_ntp  # noqa: PLC0415
+        ok = sync_rtc_from_ntp(rtc, tz_offset=_NTP_TZ_OFFSET)
+        _result("NTP sync", ok, "" if ok else "check WiFi credentials in settings.toml")
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        _result("NTP sync", False, str(exc))
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -337,34 +659,42 @@ _log("Checking: BMP390, HM3301, SHTC3, PCF8523 RTC, GPS, SD card")
 # I2C bus at 20 kHz — required for HM3301; all other I2C devices tolerate this
 i2c = busio.I2C(board.SCL, board.SDA, frequency=_I2C_FREQ_HZ)
 
-# SD card — boot.py mounted it before code.py ran; verify it is writable
+# SD card — mounted here in code.py's VM (boot.py mount is torn down before
+# code.py starts; see boot.py for details).
 sd_ok = _verify_sd()
+_track(sd_ok)
 
 # RTC provides the timestamp used in the report filename
 rtc = _check_rtc(i2c)
+_track(rtc is not None)
 
 # Sync RTC from NTP — fixes unset / drifted time before the filename is stamped
-_section("NTP Time Sync")
-if rtc is not None:
-    try:
-        from featherweather.rtc.rtc_sync import sync_rtc_from_ntp  # noqa: PLC0415
-        ntp_ok = sync_rtc_from_ntp(rtc, tz_offset=_NTP_TZ_OFFSET)
-        _result("NTP sync", ntp_ok, "" if ntp_ok else "check WiFi credentials in settings.toml")
-    except Exception as _exc:  # noqa: BLE001
-        _result("NTP sync", False, str(_exc))
-else:
-    _result("NTP sync", False, "skipped — RTC not available")
+ntp_ok = _check_ntp(rtc)
+_track(ntp_ok)
 
 # Enumerate all I2C addresses before probing individual sensors
 i2c_addrs = _scan_i2c(i2c)
 
 # Individual sensor checks
 baro_data = _check_bmp390(i2c)
+_track(baro_data is not None)
+
 th_data = _check_shtc3(i2c)
+_track(th_data is not None)
+
 aq_data = _check_hm3301(i2c)
+_track(aq_data is not None)
 
 # GPS is on UART, not I2C
 gps, gps_has_fix = _check_gps()
+gps_alive = gps is not None
+_track(gps_alive)
+
+# Disk usage
+_check_disk()
+
+# System resources (htop-style snapshot — informational, not tracked)
+_check_system()
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -372,10 +702,9 @@ gps, gps_has_fix = _check_gps()
 
 _section("Diagnostic Summary")
 
-gps_alive = gps is not None
-
 _result("SD card",             sd_ok)
 _result("PCF8523 RTC",         rtc is not None)
+_result("NTP sync",            ntp_ok)
 _result("BMP390 Barometric",   baro_data is not None)
 _result("SHTC3 Temp/Humidity", th_data is not None)
 _result("HM3301 Air Quality",  aq_data is not None)
@@ -387,18 +716,25 @@ elif gps_alive:
 else:
     _result("GPS", False, "no response")
 
-all_ok = all([
-    sd_ok,
-    rtc is not None,
-    baro_data is not None,
-    th_data is not None,
-    aq_data is not None,
-    gps_alive,
-])
+total_tests = _pass_count + _fail_count
+all_ok = _fail_count == 0
+fail_pct = (_fail_count / total_tests * 100) if total_tests else 0.0
 
 _log()
+_log(f"Tests: {total_tests}  passed={_pass_count}  failed={_fail_count}")
 _log("Overall: " + ("ALL SYSTEMS GO" if all_ok else "ISSUES DETECTED — see details above"))
 _log()
+
+# NeoPixel summary flash:
+#   All passed  → green × total_tests
+#   < 50% failed → yellow × failed_count
+#   ≥ 50% failed → red × failed_count
+if all_ok:
+    _flash(_GREEN, count=total_tests, on_ms=300, off_ms=150)
+elif fail_pct < 50.0:
+    _flash(_YELLOW, count=_fail_count, on_ms=300, off_ms=150)
+else:
+    _flash(_RED, count=_fail_count, on_ms=300, off_ms=150)
 
 # ---------------------------------------------------------------------------
 # Persist report to SD card

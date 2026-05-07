@@ -1,20 +1,25 @@
-"""Install CircuitPython libraries on the device over WiFi.
+"""Install CircuitPython libraries on the device.
 
 Bypasses circup's HTTP directory-scan (which times out on the ESP32 web
 server when the /lib tree is deep).  Instead, extracts the needed .mpy
 files from the locally-cached Adafruit CircuitPython Bundle and uploads
-them via the same HTTP PUT workflow used by deploy.py.
+them via WiFi (default) or serial/rshell (--serial).
 
 The bundle is downloaded by circup and lives at:
     ~/.local/share/circup/adafruit-circuitpython-bundle-<ver>mpy.zip
 
 Usage:
-    poetry run circup-install
-    python scripts/circup_install.py
+    poetry run circup-install                       # WiFi upload
+    poetry run circup-install --serial              # serial via rshell
+    poetry run circup-install --serial --port /dev/ttyACM1
 """
 
+import argparse
 import base64
+import shutil
+import subprocess
 import sys
+import tempfile
 import tomllib
 import urllib.error
 import urllib.request
@@ -135,32 +140,13 @@ def _remote_path(zip_entry: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Shared: resolve lib names from pyproject.toml
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
-    if not PYPROJECT_PATH.exists():
-        print(f"Error: {PYPROJECT_PATH} not found", file=sys.stderr)
-        return 1
-    if not SETTINGS_PATH.exists():
-        print(
-            f"Error: {SETTINGS_PATH} not found — copy settings.toml.example",
-            file=sys.stderr,
-        )
-        return 1
-
+def _resolve_lib_names() -> tuple[list[str], list[str]]:
+    """Return (lib_names, unknown_pkgs) from pyproject.toml + always-required."""
     pyproject = _load_toml(PYPROJECT_PATH)
-    settings = _load_toml(SETTINGS_PATH)
-
-    host = settings.get("ESP32_IP", "").strip()
-    if not host:
-        print("Error: ESP32_IP not set in settings.toml", file=sys.stderr)
-        return 1
-    password = settings.get("CIRCUITPY_WEB_API_PASSWORD", "").strip()
-    auth = _auth_header(password)
-
-    # Collect the libraries declared in pyproject.toml + always-required ones
     raw_deps: list[str] = pyproject.get("project", {}).get("dependencies", [])
     pkg_names = []
     for dep in raw_deps:
@@ -171,7 +157,6 @@ def main() -> int:
         if always not in pkg_names:
             pkg_names.append(always)
 
-    # Resolve to lib names
     lib_names: list[str] = []
     unknown: list[str] = []
     for pkg in pkg_names:
@@ -179,10 +164,16 @@ def main() -> int:
             lib_names.extend(_LIB_MAP[pkg])
         else:
             unknown.append(pkg)
-    if unknown:
-        print(f"Warning: no lib mapping for: {unknown} — skipping", file=sys.stderr)
+    return lib_names, unknown
 
-    bundle_path = _find_bundle()
+
+# ---------------------------------------------------------------------------
+# WiFi install
+# ---------------------------------------------------------------------------
+
+
+def install_wifi(host: str, password: str, lib_names: list[str], bundle_path: Path) -> int:
+    auth = _auth_header(password)
     print(f"Bundle  : {bundle_path.name}")
     print(f"Host    : {host}")
     print(f"Libs    : {', '.join(lib_names)}")
@@ -199,24 +190,115 @@ def main() -> int:
                 skipped += 1
                 continue
 
-            # Create parent directory on device if this is a package
             if lib_name.endswith("/"):
                 _mkdir(host, f"lib/{lib_name.rstrip('/')}", auth)
 
             for entry in entries:
                 remote = _remote_path(entry)
-                # Ensure intermediate directories exist
                 parts = remote.split("/")
                 for depth in range(2, len(parts)):
                     _mkdir(host, "/".join(parts[:depth]), auth)
-
-                data = zf.read(entry)
-                _put(host, remote, data, auth)
+                _put(host, remote, zf.read(entry), auth)
                 print(f"  uploaded  {remote}")
                 uploaded += 1
 
     print(f"\nDone — {uploaded} file(s) uploaded, {skipped} skipped.")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Serial install (rshell)
+# ---------------------------------------------------------------------------
+
+
+def install_serial(port: str, lib_names: list[str], bundle_path: Path) -> int:
+    print(f"Bundle  : {bundle_path.name}")
+    print(f"Port    : {port}")
+    print(f"Libs    : {', '.join(lib_names)}")
+    print()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        extracted = 0
+        skipped = 0
+
+        with zipfile.ZipFile(bundle_path) as zf:
+            for lib_name in lib_names:
+                entries = _extract_lib_entries(zf, lib_name)
+                if not entries:
+                    print(f"  [WARN] {lib_name} — not found in bundle")
+                    skipped += 1
+                    continue
+                for entry in entries:
+                    rel = _remote_path(entry)          # e.g. lib/adafruit_sdcard.mpy
+                    dest = tmp_path / rel[len("lib/"):]  # strip leading lib/
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(zf.read(entry))
+                    extracted += 1
+                print(f"  extracted {lib_name}  ({len(entries)} file(s))")
+
+        print(f"\nUploading {extracted} file(s) via rshell ...")
+        result = subprocess.run([
+            "rshell",
+            "--port", port,
+            "--buffer-size", "512",
+            "rsync", str(tmp_path), "/pyboard/lib",
+        ])
+        if result.returncode != 0:
+            print("Error: rshell rsync failed", file=sys.stderr)
+            return 1
+
+    print(f"\nDone — {extracted} file(s) uploaded, {skipped} skipped.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Install CircuitPython libraries on device.")
+    parser.add_argument(
+        "--serial",
+        action="store_true",
+        help="Install via USB-serial using rshell (use when WiFi is unavailable)",
+    )
+    parser.add_argument(
+        "--port",
+        metavar="PORT",
+        default="/dev/ttyACM0",
+        help="Serial port for --serial mode (default: /dev/ttyACM0)",
+    )
+    args = parser.parse_args()
+
+    if not PYPROJECT_PATH.exists():
+        print(f"Error: {PYPROJECT_PATH} not found", file=sys.stderr)
+        return 1
+
+    lib_names, unknown = _resolve_lib_names()
+    if unknown:
+        print(f"Warning: no lib mapping for: {unknown} — skipping", file=sys.stderr)
+
+    bundle_path = _find_bundle()
+
+    if args.serial:
+        return install_serial(args.port, lib_names, bundle_path)
+
+    if not SETTINGS_PATH.exists():
+        print(
+            f"Error: {SETTINGS_PATH} not found — copy settings.toml.example",
+            file=sys.stderr,
+        )
+        return 1
+    settings = _load_toml(SETTINGS_PATH)
+    host = settings.get("ESP32_IP", "").strip()
+    if not host:
+        print("Error: ESP32_IP not set in settings.toml", file=sys.stderr)
+        return 1
+    password = settings.get("CIRCUITPY_WEB_API_PASSWORD", "").strip()
+
+    return install_wifi(host, password, lib_names, bundle_path)
 
 
 if __name__ == "__main__":
