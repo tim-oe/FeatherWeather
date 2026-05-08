@@ -9,12 +9,12 @@ Three transport modes are supported:
     The CIRCUITPY_WEB_API_PASSWORD from settings.toml is sent as HTTP Basic
     Auth (empty username, password as configured on the device).
 
-  Serial / rshell  (--serial)
-    Transfers files over the USB-serial port using rshell.
+  Serial / mpremote  (--serial)
+    Transfers files over the USB-serial port using mpremote.
     Use when WiFi is unavailable or the device is in a broken state.
     The Feather ESP32 V2 uses a CH340 USB-to-serial chip; it never exposes a
     CIRCUITPY mass-storage drive, so this is the correct USB recovery path.
-    Requires: poetry run rshell (already a project dependency).
+    Requires: poetry run mpremote (already a project dependency).
 
   USB mass storage  (--usb / --usb-path)
     Copies files directly to a CIRCUITPY drive mounted as a filesystem.
@@ -27,7 +27,7 @@ Usage:
     python scripts/deploy.py --skip-tests           # skip tests before deploy
     python scripts/deploy.py --diagnostic           # deploy diagnostic.py as code.py
     python scripts/deploy.py --sysmon               # deploy sysmon.py as code.py
-    python scripts/deploy.py --serial               # serial deploy via rshell
+    python scripts/deploy.py --serial               # serial deploy via mpremote
     python scripts/deploy.py --serial --diagnostic  # serial + diagnostic mode
     python scripts/deploy.py --serial --sysmon      # serial + live monitor
     python scripts/deploy.py --serial --port /dev/ttyACM1  # non-default port
@@ -219,24 +219,11 @@ def deploy_wifi(host: str, password: str, mode: str = "normal") -> int:
 
 
 # ---------------------------------------------------------------------------
-# Serial deployment (rshell)
+# Serial deployment (mpremote)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
-_RSHELL_BUFFER = "512"
 
-
-def _rshell(port: str, *cmd_args: str) -> None:
-    """Run a single rshell command; raise RuntimeError on non-zero exit."""
-    argv = [
-        "rshell",
-        "--port", port,
-        "--buffer-size", _RSHELL_BUFFER,
-        *cmd_args,
-    ]
-    result = subprocess.run(argv)
-    if result.returncode != 0:
-        raise RuntimeError(f"rshell {' '.join(cmd_args)} failed (exit {result.returncode})")
 
 
 def deploy_serial(port: str, mode: str = "normal") -> int:
@@ -249,41 +236,88 @@ def deploy_serial(port: str, mode: str = "normal") -> int:
         print(banner)
     print("=" * 60)
 
-    try:
-        # 1. settings.toml — always restored on serial deploy because a wiped
-        #    filesystem leaves it empty, breaking WiFi on the next boot.
-        if SETTINGS_PATH.exists():
-            print("\n[1/4] Uploading settings.toml ...")
-            _rshell(port, "cp", str(SETTINGS_PATH), "/pyboard/settings.toml")
-        else:
-            print("\n[1/4] settings.toml not found locally — skipping")
-
-        # 2. boot.py
-        print("\n[2/4] Uploading boot.py ...")
-        if not BOOT_PY.exists():
-            print(f"Error: {BOOT_PY} not found", file=sys.stderr)
-            return 1
-        _rshell(port, "cp", str(BOOT_PY), "/pyboard/boot.py")
-
-        # 3. code.py
-        print(f"\n[3/4] Uploading {mode_label} ...")
-        if not source_file.exists():
-            print(f"Error: {source_file} not found", file=sys.stderr)
-            return 1
-        _rshell(port, "cp", str(source_file), "/pyboard/code.py")
-
-        # 4. featherweather package
-        print("\n[4/4] Syncing featherweather package ...")
-        if not LIB_SRC.exists():
-            print(f"Error: {LIB_SRC} not found", file=sys.stderr)
-            return 1
-        _rshell(port, "rsync", str(LIB_SRC), "/pyboard/lib/featherweather")
-
-    except RuntimeError as exc:
-        print(f"\nError: {exc}", file=sys.stderr)
+    if not source_file.exists():
+        print(f"Error: {source_file} not found", file=sys.stderr)
+        return 1
+    if not BOOT_PY.exists():
+        print(f"Error: {BOOT_PY} not found", file=sys.stderr)
+        return 1
+    if not LIB_SRC.exists():
+        print(f"Error: {LIB_SRC} not found", file=sys.stderr)
         return 1
 
-    print("\nDeploy complete.")
+    py_files = sorted(LIB_SRC.rglob("*.py"))
+
+    # Collect every directory path needed under lib/featherweather/ on the device.
+    # "lib" is omitted — it always exists on any CircuitPython device.
+    dirs_to_create: list[str] = ["lib/featherweather"]
+    for f in py_files:
+        rel = f.relative_to(LIB_SRC)
+        for depth in range(1, len(rel.parts)):
+            d = "lib/featherweather/" + "/".join(rel.parts[:depth])
+            if d not in dirs_to_create:
+                dirs_to_create.append(d)
+
+    # -----------------------------------------------------------------------
+    # Single mpremote session: exec (mkdir + touch) then cp all files.
+    #
+    # Why a single session matters:
+    #   Each subprocess call causes a soft reset, which runs boot.py (I2C RTC
+    #   sync).  Combining everything into one chain cuts that from 2 resets to 1.
+    #
+    # Why we pre-touch every destination file in the exec:
+    #   mpremote's _convert_filesystem_error can't parse CircuitPython's
+    #   "OSError: [Errno 2] No such file/directory" format, so for absent files
+    #   it returns TransportExecError instead of OSError.  fs_exists only catches
+    #   OSError, so the error escapes and kills the cp before any write happens.
+    #   Pre-touching ensures fs_exists always returns True, sidestepping the bug.
+    #
+    # Why -f on the featherweather files:
+    #   With files pre-touched (empty), the hash fallback in fs_hashfile would
+    #   read 0 bytes, compute the hash of empty content, see a mismatch, and copy
+    #   anyway — but that's an extra read round-trip per file.  -f skips the hash
+    #   check entirely (fs_exists still runs and succeeds since files are touched).
+    # -----------------------------------------------------------------------
+    print("\n[4/4] featherweather package")
+    print(f"  Creating {len(dirs_to_create)} directories + touching {len(py_files)} files ...")
+
+    mkdir_lines = ["import os"]
+    for d in dirs_to_create:
+        mkdir_lines += [
+            "try:",
+            f"    os.mkdir('/{d}')",
+            "except OSError:",
+            "    pass",
+        ]
+    for f in py_files:
+        rel = f.relative_to(LIB_SRC)
+        dest_path = "/lib/featherweather/" + "/".join(rel.parts)
+        mkdir_lines.append(f"open('{dest_path}','wb').close()")
+    mkdir_code = "\n".join(mkdir_lines) + "\n"
+
+    # Build a single chain: exec (mkdir+touch) then cp everything with -f.
+    # -f skips the hash check on all files.  The hash check reads the entire
+    # remote file back over serial to compute a local hash — slower than just
+    # overwriting, since a deploy always implies something changed.
+    chain: list[str] = ["mpremote", "connect", port, "+", "exec", mkdir_code]
+
+    if SETTINGS_PATH.exists():
+        chain += ["+", "cp", "-f", str(SETTINGS_PATH), ":settings.toml"]
+
+    chain += ["+", "cp", "-f", str(BOOT_PY), ":boot.py"]
+    chain += ["+", "cp", "-f", str(source_file), ":code.py"]
+
+    print(f"  Copying {len(py_files)} files ...")
+    for f in py_files:
+        rel = f.relative_to(LIB_SRC)
+        chain += ["+", "cp", "-f", str(f), ":lib/featherweather/" + "/".join(rel.parts)]
+
+    result = subprocess.run(chain)
+    if result.returncode != 0:
+        print("\nError: mpremote file transfer failed.", file=sys.stderr)
+        return 1
+
+    print(f"\nDeploy complete — {len(py_files)} library file(s) uploaded.")
     return 0
 
 
@@ -398,7 +432,7 @@ def main() -> int:
         "--serial",
         action="store_true",
         help=(
-            "Deploy over USB-serial using rshell (use when WiFi is unavailable). "
+            "Deploy over USB-serial using mpremote (use when WiFi is unavailable). "
             "Required for Feather ESP32 V2 which has no USB mass-storage drive."
         ),
     )

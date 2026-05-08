@@ -2,10 +2,9 @@
 
 Deploy as code.py to watch live resource usage on the device:
 
-    poetry run rshell -p /dev/ttyACM0 cp sysmon.py /pyboard/code.py
-    poetry run rshell -p /dev/ttyACM0 repl
-    # press any key to enter REPL, then type:  exec(open('code.py').read())
-    # or just Ctrl+D to soft-reboot and let it run automatically
+    poetry run deploy --serial --sysmon
+    poetry run mpremote connect /dev/ttyACM0 repl
+    # Ctrl+D to soft-reboot and let it run automatically; Ctrl+X to exit REPL
 
 Why no real htop?
   CircuitPython on ESP32 doesn't expose the FreeRTOS task table or

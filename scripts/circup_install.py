@@ -3,14 +3,14 @@
 Bypasses circup's HTTP directory-scan (which times out on the ESP32 web
 server when the /lib tree is deep).  Instead, extracts the needed .mpy
 files from the locally-cached Adafruit CircuitPython Bundle and uploads
-them via WiFi (default) or serial/rshell (--serial).
+them via WiFi (default) or serial/mpremote (--serial).
 
 The bundle is downloaded by circup and lives at:
     ~/.local/share/circup/adafruit-circuitpython-bundle-<ver>mpy.zip
 
 Usage:
     poetry run circup-install                       # WiFi upload
-    poetry run circup-install --serial              # serial via rshell
+    poetry run circup-install --serial              # serial via mpremote
     poetry run circup-install --serial --port /dev/ttyACM1
 """
 
@@ -33,21 +33,18 @@ SETTINGS_PATH = REPO_ROOT / "settings.toml"
 BUNDLE_CACHE_DIR = Path.home() / ".local" / "share" / "circup"
 CP_LIB_PREFIX = "adafruit-circuitpython-"
 
-# Explicit mapping: pyproject dependency name → bundle lib name(s).
-# A lib name ending in "/" means a directory; without means a single .mpy file.
-_LIB_MAP: dict[str, list[str]] = {
-    "adafruit-circuitpython-bmp3xx":      ["adafruit_bmp3xx"],
-    "adafruit-circuitpython-bus-device":  ["adafruit_bus_device/"],
-    "adafruit-circuitpython-gps":         ["adafruit_gps"],
-    "adafruit-circuitpython-neopixel":    ["neopixel"],
-    "adafruit-circuitpython-ntp":         ["adafruit_ntp"],
-    "adafruit-circuitpython-pcf8523":     ["adafruit_pcf8523/"],
-    "adafruit-circuitpython-sd":          ["adafruit_sdcard"],
-    "adafruit-circuitpython-shtc3":       ["adafruit_shtc3"],
+# Name overrides — only needed when the bundle module name does NOT follow the
+# standard auto-derivation rule:
+#   strip "adafruit-circuitpython-" prefix, replace "-" → "_", prepend "adafruit_"
+# e.g. "adafruit-circuitpython-bmp3xx" → "adafruit_bmp3xx"  (no override needed)
+#
+# Add a new dependency to pyproject.toml and it is picked up automatically.
+# Only add an entry here if the bundle name genuinely differs from the derivation.
+_OVERRIDES: dict[str, list[str]] = {
+    "adafruit-circuitpython-busdevice": ["adafruit_bus_device"],
+    "adafruit-circuitpython-neopixel":  ["neopixel"],
+    "adafruit-circuitpython-sd":        ["adafruit_sdcard"],
 }
-
-# adafruit_bus_device is always required (used by HM3301 AQI sensor)
-_ALWAYS_INCLUDE = ["adafruit-circuitpython-bus-device"]
 
 
 # ---------------------------------------------------------------------------
@@ -118,19 +115,33 @@ def _find_bundle(cp_major: int = 10) -> Path:
     )
 
 
-def _extract_lib_entries(zf: zipfile.ZipFile, lib_name: str) -> list[str]:
-    """Return all zip entries that belong to lib_name inside the lib/ folder."""
-    is_dir = lib_name.endswith("/")
-    base = lib_name.rstrip("/")
+def _derive_module_name(pkg_name: str) -> str:
+    """Derive the bundle module name from an adafruit-circuitpython-* package name.
 
-    if is_dir:
-        prefix_mpy = f"/lib/{base}/"
-        return [n for n in zf.namelist() if f"/lib/{base}/" in n and not n.endswith("/")]
-    else:
-        return [
-            n for n in zf.namelist()
-            if n.endswith(f"/lib/{base}.mpy") or n.endswith(f"/lib/{base}.py")
-        ]
+    Strips the ``adafruit-circuitpython-`` prefix, replaces ``-`` with ``_``,
+    and prepends ``adafruit_``.  Works for the vast majority of packages; the
+    handful that differ are listed in ``_OVERRIDES``.
+    """
+    suffix = pkg_name.removeprefix(CP_LIB_PREFIX).replace("-", "_")
+    return f"adafruit_{suffix}"
+
+
+def _extract_lib_entries(zf: zipfile.ZipFile, module_name: str) -> list[str]:
+    """Return all zip entries for *module_name*, auto-detecting file vs directory.
+
+    Checks for a package directory (``/lib/<module_name>/``) first; falls back
+    to a single ``.mpy`` / ``.py`` file.  No trailing slash required in the name.
+    """
+    names = zf.namelist()
+    # Package directory
+    entries = [n for n in names if f"/lib/{module_name}/" in n and not n.endswith("/")]
+    if entries:
+        return entries
+    # Single file
+    return [
+        n for n in names
+        if n.endswith(f"/lib/{module_name}.mpy") or n.endswith(f"/lib/{module_name}.py")
+    ]
 
 
 def _remote_path(zip_entry: str) -> str:
@@ -144,27 +155,26 @@ def _remote_path(zip_entry: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_lib_names() -> tuple[list[str], list[str]]:
-    """Return (lib_names, unknown_pkgs) from pyproject.toml + always-required."""
+def _resolve_module_names() -> list[str]:
+    """Derive bundle module names for all adafruit-circuitpython-* deps in pyproject.toml.
+
+    For each matching dependency, checks ``_OVERRIDES`` first; if absent, applies
+    the standard derivation rule via ``_derive_module_name()``.  No manual mapping
+    table to maintain — adding a dep to pyproject.toml is the only required step.
+    """
     pyproject = _load_toml(PYPROJECT_PATH)
     raw_deps: list[str] = pyproject.get("project", {}).get("dependencies", [])
-    pkg_names = []
-    for dep in raw_deps:
-        name = dep.split()[0].split("(")[0].split(">=")[0].split("==")[0].strip().lower()
-        if name.startswith(CP_LIB_PREFIX):
-            pkg_names.append(name)
-    for always in _ALWAYS_INCLUDE:
-        if always not in pkg_names:
-            pkg_names.append(always)
 
-    lib_names: list[str] = []
-    unknown: list[str] = []
-    for pkg in pkg_names:
-        if pkg in _LIB_MAP:
-            lib_names.extend(_LIB_MAP[pkg])
+    module_names: list[str] = []
+    for dep in raw_deps:
+        pkg = dep.split()[0].split("(")[0].strip().lower()
+        if not pkg.startswith(CP_LIB_PREFIX):
+            continue
+        if pkg in _OVERRIDES:
+            module_names.extend(_OVERRIDES[pkg])
         else:
-            unknown.append(pkg)
-    return lib_names, unknown
+            module_names.append(_derive_module_name(pkg))
+    return module_names
 
 
 # ---------------------------------------------------------------------------
@@ -172,29 +182,27 @@ def _resolve_lib_names() -> tuple[list[str], list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def install_wifi(host: str, password: str, lib_names: list[str], bundle_path: Path) -> int:
+def install_wifi(host: str, password: str, module_names: list[str], bundle_path: Path) -> int:
     auth = _auth_header(password)
     print(f"Bundle  : {bundle_path.name}")
     print(f"Host    : {host}")
-    print(f"Libs    : {', '.join(lib_names)}")
+    print(f"Modules : {', '.join(module_names)}")
     print()
 
     uploaded = 0
     skipped = 0
 
     with zipfile.ZipFile(bundle_path) as zf:
-        for lib_name in lib_names:
-            entries = _extract_lib_entries(zf, lib_name)
+        for module_name in module_names:
+            entries = _extract_lib_entries(zf, module_name)
             if not entries:
-                print(f"  [WARN] {lib_name} — not found in bundle")
+                print(f"  [WARN] {module_name} — not found in bundle")
                 skipped += 1
                 continue
 
-            if lib_name.endswith("/"):
-                _mkdir(host, f"lib/{lib_name.rstrip('/')}", auth)
-
             for entry in entries:
                 remote = _remote_path(entry)
+                # Create any intermediate directories the entry requires
                 parts = remote.split("/")
                 for depth in range(2, len(parts)):
                     _mkdir(host, "/".join(parts[:depth]), auth)
@@ -207,14 +215,14 @@ def install_wifi(host: str, password: str, lib_names: list[str], bundle_path: Pa
 
 
 # ---------------------------------------------------------------------------
-# Serial install (rshell)
+# Serial install (mpremote)
 # ---------------------------------------------------------------------------
 
 
-def install_serial(port: str, lib_names: list[str], bundle_path: Path) -> int:
+def install_serial(port: str, module_names: list[str], bundle_path: Path) -> int:
     print(f"Bundle  : {bundle_path.name}")
     print(f"Port    : {port}")
-    print(f"Libs    : {', '.join(lib_names)}")
+    print(f"Modules : {', '.join(module_names)}")
     print()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -223,29 +231,64 @@ def install_serial(port: str, lib_names: list[str], bundle_path: Path) -> int:
         skipped = 0
 
         with zipfile.ZipFile(bundle_path) as zf:
-            for lib_name in lib_names:
-                entries = _extract_lib_entries(zf, lib_name)
+            for module_name in module_names:
+                entries = _extract_lib_entries(zf, module_name)
                 if not entries:
-                    print(f"  [WARN] {lib_name} — not found in bundle")
+                    print(f"  [WARN] {module_name} — not found in bundle")
                     skipped += 1
                     continue
                 for entry in entries:
-                    rel = _remote_path(entry)          # e.g. lib/adafruit_sdcard.mpy
+                    rel = _remote_path(entry)            # e.g. lib/adafruit_sdcard.mpy
                     dest = tmp_path / rel[len("lib/"):]  # strip leading lib/
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     dest.write_bytes(zf.read(entry))
                     extracted += 1
-                print(f"  extracted {lib_name}  ({len(entries)} file(s))")
+                print(f"  extracted {module_name}  ({len(entries)} file(s))")
 
-        print(f"\nUploading {extracted} file(s) via rshell ...")
-        result = subprocess.run([
-            "rshell",
-            "--port", port,
-            "--buffer-size", "512",
-            "rsync", str(tmp_path), "/pyboard/lib",
-        ])
+        # Collect subdirectory paths that need to be created on the device.
+        # "lib" is omitted — it always exists on any CircuitPython device.
+        dirs_to_create: list[str] = []
+        for fn in sorted(tmp_path.rglob("*")):
+            if fn.is_file():
+                rel = fn.relative_to(tmp_path)
+                for depth in range(1, len(rel.parts)):
+                    d = "lib/" + "/".join(rel.parts[:depth])
+                    if d not in dirs_to_create and d != "lib":
+                        dirs_to_create.append(d)
+
+        print(f"\nUploading {extracted} file(s) via mpremote ...")
+
+        # Single mpremote session: exec (mkdir + touch) then cp all files.
+        # Pre-touching every destination file lets fs_exists return True,
+        # sidestepping the _convert_filesystem_error bug for absent files.
+        # -f skips the per-file hash read round-trip (files are empty anyway).
+        file_entries = sorted(fn for fn in tmp_path.rglob("*") if fn.is_file())
+
+        mkdir_lines = ["import os"]
+        for d in dirs_to_create:
+            mkdir_lines += [
+                "try:",
+                f"    os.mkdir('/{d}')",
+                "except OSError:",
+                "    pass",
+            ]
+        for fn in file_entries:
+            rel = fn.relative_to(tmp_path)
+            dest_path = "/lib/" + "/".join(rel.parts)
+            mkdir_lines.append(f"open('{dest_path}','wb').close()")
+        mkdir_code = "\n".join(mkdir_lines) + "\n"
+
+        if dirs_to_create or file_entries:
+            print(f"  Creating {len(dirs_to_create)} directories + touching {len(file_entries)} files ...")
+
+        chain: list[str] = ["mpremote", "connect", port, "+", "exec", mkdir_code]
+        for fn in file_entries:
+            rel = fn.relative_to(tmp_path)
+            chain += ["+", "cp", "-f", str(fn), ":lib/" + "/".join(rel.parts)]
+
+        result = subprocess.run(chain)
         if result.returncode != 0:
-            print("Error: rshell rsync failed", file=sys.stderr)
+            print("Error: mpremote upload failed", file=sys.stderr)
             return 1
 
     print(f"\nDone — {extracted} file(s) uploaded, {skipped} skipped.")
@@ -262,7 +305,7 @@ def main() -> int:
     parser.add_argument(
         "--serial",
         action="store_true",
-        help="Install via USB-serial using rshell (use when WiFi is unavailable)",
+        help="Install via USB-serial using mpremote (use when WiFi is unavailable)",
     )
     parser.add_argument(
         "--port",
@@ -276,14 +319,11 @@ def main() -> int:
         print(f"Error: {PYPROJECT_PATH} not found", file=sys.stderr)
         return 1
 
-    lib_names, unknown = _resolve_lib_names()
-    if unknown:
-        print(f"Warning: no lib mapping for: {unknown} — skipping", file=sys.stderr)
-
+    module_names = _resolve_module_names()
     bundle_path = _find_bundle()
 
     if args.serial:
-        return install_serial(args.port, lib_names, bundle_path)
+        return install_serial(args.port, module_names, bundle_path)
 
     if not SETTINGS_PATH.exists():
         print(
@@ -298,7 +338,7 @@ def main() -> int:
         return 1
     password = settings.get("CIRCUITPY_WEB_API_PASSWORD", "").strip()
 
-    return install_wifi(host, password, lib_names, bundle_path)
+    return install_wifi(host, password, module_names, bundle_path)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ Hardware checked
     HM3301       PM air quality                     I2C 0x40  (bus <= 20 kHz)
     SHTC3        temperature / humidity             I2C 0x70
     PCF8523      Adalogger FeatherWing RTC          I2C 0x68
+    SH1107       OLED FeatherWing #4650 128×64      I2C 0x3C
     Ultimate GPS UART NMEA activity + optional fix  board.TX / board.RX
     SD card      Adalogger FeatherWing SPI storage  board.D10 CS
 
@@ -47,6 +48,8 @@ _SD_CS_PIN = board.D33
 
 # Set by _verify_sd() so _check_disk() can call sdcard.count() for true capacity.
 _sdcard = None
+# Set by _check_oled() so _update_oled_summary() can refresh the screen at the end.
+_oled_display = None
 _GPS_BAUD: int = 9600
 _GPS_NMEA_CHECK_S: float = 5.0    # seconds to wait for the first NMEA sentence
 _GPS_FIX_TIMEOUT_S: float = 30.0  # seconds to attempt a GPS fix
@@ -54,6 +57,8 @@ _I2C_FREQ_HZ: int = 20_000        # HM3301 maximum; all other I2C devices tolera
 _NTP_TZ_OFFSET: int = int(__import__("os").getenv("NTP_TIMEZONE_OFFSET") or 0)
 
 _KNOWN_I2C_ADDRS: dict = {
+    0x1D: "SEN0575 (Rainfall)",
+    0x3C: "SH1107 (OLED FeatherWing #4650)",
     0x40: "HM3301 (Air Quality)",
     0x68: "PCF8523 (Adalogger RTC)",
     0x70: "SHTC3 (Temp/Humidity)",
@@ -453,8 +458,24 @@ def _check_ntp(rtc) -> bool:
     try:
         from featherweather.rtc.rtc_sync import sync_rtc_from_ntp  # noqa: PLC0415
         ok = sync_rtc_from_ntp(rtc, tz_offset=_NTP_TZ_OFFSET)
-        _result("NTP sync", ok, "" if ok else "check WiFi credentials in settings.toml")
-        return ok
+        if ok:
+            _result("NTP sync", True, "")
+            return True
+        # On failure, dump the WiFi state so we know where to point the finger:
+        # bad credentials? no gateway? blocked outbound UDP/123?
+        try:
+            import wifi  # noqa: PLC0415
+            if not wifi.radio.connected:
+                hint = "WiFi not connected — check CIRCUITPY_WIFI_SSID/PASSWORD"
+            else:
+                hint = (
+                    f"WiFi up (ip={wifi.radio.ipv4_address}, gw={wifi.radio.ipv4_gateway}); "
+                    "router/ISP likely blocking UDP/123 or no internet route"
+                )
+        except Exception:  # noqa: BLE001
+            hint = "WiFi state unavailable"
+        _result("NTP sync", False, hint)
+        return False
     except Exception as exc:  # noqa: BLE001
         _result("NTP sync", False, str(exc))
         return False
@@ -546,6 +567,82 @@ def _check_hm3301(i2c):
     except Exception as exc:  # noqa: BLE001
         _result("HM3301 init + read", False, str(exc))
         return None
+
+
+# ---------------------------------------------------------------------------
+# OLED FeatherWing #4650 (SH1107 128×64)
+# ---------------------------------------------------------------------------
+
+
+def _check_oled(i2c):
+    """Initialise the SH1107 display and render a diagnostic splash screen.
+
+    Stores the live display object in ``_oled_display`` so that
+    ``_update_oled_summary()`` can refresh it with the final pass/fail counts.
+    """
+    global _oled_display  # noqa: PLW0603
+    _section("OLED FeatherWing #4650 (SH1107 128x64)")
+    try:
+        import displayio                          # noqa: PLC0415
+        import i2cdisplaybus                      # noqa: PLC0415
+        import terminalio                         # noqa: PLC0415
+        from adafruit_display_text import label   # noqa: PLC0415
+        from adafruit_displayio_sh1107 import (  # noqa: PLC0415
+            DISPLAY_OFFSET_ADAFRUIT_FEATHERWING_OLED_4650,
+            SH1107,
+        )
+
+        displayio.release_displays()
+        display_bus = i2cdisplaybus.I2CDisplayBus(i2c, device_address=0x3C)
+        display = SH1107(
+            display_bus,
+            width=128,
+            height=64,
+            display_offset=DISPLAY_OFFSET_ADAFRUIT_FEATHERWING_OLED_4650,
+            rotation=0,
+        )
+
+        group = displayio.Group()
+        group.append(label.Label(terminalio.FONT, text="FeatherWeather", x=0, y=6,  color=0xFFFFFF))
+        group.append(label.Label(terminalio.FONT, text="DIAG MODE",      x=0, y=20, color=0xFFFFFF))
+        group.append(label.Label(terminalio.FONT, text="I2C 0x3C  OK",   x=0, y=34, color=0xFFFFFF))
+        group.append(label.Label(terminalio.FONT, text="Running checks..",x=0, y=48, color=0xFFFFFF))
+        display.root_group = group
+
+        _result("SH1107 init + render", True, "I2C 0x3C, 128x64")
+        _oled_display = display
+        return display
+    except Exception as exc:  # noqa: BLE001
+        _result("SH1107 init + render", False, str(exc))
+        return None
+
+
+def _update_oled_summary(passed: int, failed: int) -> None:
+    """Overwrite the OLED splash with the final pass/fail summary.
+
+    No-ops silently if the display was not initialised (OLED check failed or
+    the display is not connected).
+    """
+    if _oled_display is None:
+        return
+    try:
+        import displayio                         # noqa: PLC0415
+        import terminalio                        # noqa: PLC0415
+        from adafruit_display_text import label  # noqa: PLC0415
+
+        total = passed + failed
+        status = "ALL PASS" if failed == 0 else f"{failed}/{total} FAIL"
+        color = 0xFFFFFF
+
+        group = displayio.Group()
+        group.append(label.Label(terminalio.FONT, text="FeatherWeather", x=0, y=6,  color=color))
+        group.append(label.Label(terminalio.FONT, text="DIAG COMPLETE",  x=0, y=20, color=color))
+        group.append(label.Label(terminalio.FONT, text=f"Pass: {passed}", x=0, y=34, color=color))
+        group.append(label.Label(terminalio.FONT, text=f"Fail: {failed}", x=0, y=48, color=color))
+        group.append(label.Label(terminalio.FONT, text=status,            x=0, y=58, color=color))
+        _oled_display.root_group = group
+    except Exception:  # noqa: BLE001
+        pass  # display update is best-effort in diagnostic mode
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +764,18 @@ def _write_report(rtc) -> None:
 
 _log("FeatherWeather Diagnostic Mode")
 _log(f"Started  monotonic={time.monotonic():.1f}s")
-_log("Checking: BMP390, HM3301, SHTC3, PCF8523 RTC, GPS, SD card")
+_log("Checking: BMP390, HM3301, SHTC3, PCF8523 RTC, SH1107 OLED, GPS, SD card")
+
+# Release any displayio displays left active by the previous code.py run.
+# A normal code.py boot initialises the SH1107 OLED, which claims board.SCL/SDA
+# via i2cdisplaybus.  On soft-reboot into diagnostic.py those pins remain held
+# until release_displays() is called, otherwise busio.I2C() below raises
+# "ValueError: SCL in use".
+try:
+    import displayio  # noqa: PLC0415
+    displayio.release_displays()
+except Exception:  # noqa: BLE001
+    pass
 
 # I2C bus at 20 kHz — required for HM3301; all other I2C devices tolerate this
 i2c = busio.I2C(board.SCL, board.SDA, frequency=_I2C_FREQ_HZ)
@@ -687,6 +795,10 @@ _track(ntp_ok)
 
 # Enumerate all I2C addresses before probing individual sensors
 i2c_addrs = _scan_i2c(i2c)
+
+# OLED — checked early so the display can show progress during remaining tests
+oled_display = _check_oled(i2c)
+_track(oled_display is not None)
 
 # Individual sensor checks
 baro_data = _check_bmp390(i2c)
@@ -718,6 +830,7 @@ _section("Diagnostic Summary")
 _result("SD card",             sd_ok)
 _result("PCF8523 RTC",         rtc is not None)
 _result("NTP sync",            ntp_ok)
+_result("SH1107 OLED",         oled_display is not None)
 _result("BMP390 Barometric",   baro_data is not None)
 _result("SHTC3 Temp/Humidity", th_data is not None)
 _result("HM3301 Air Quality",  aq_data is not None)
@@ -748,6 +861,9 @@ elif fail_pct < 50.0:
     _flash(_YELLOW, count=_fail_count, on_ms=300, off_ms=150)
 else:
     _flash(_RED, count=_fail_count, on_ms=300, off_ms=150)
+
+# Update OLED with final pass/fail counts
+_update_oled_summary(_pass_count, _fail_count)
 
 # ---------------------------------------------------------------------------
 # Persist report to SD card

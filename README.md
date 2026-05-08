@@ -11,6 +11,7 @@ ESP32-based weather station with GPS timestamping, battery-backed RTC, and SD ca
 | [Adafruit ESP32 Feather V2 w.FL](https://www.adafruit.com/product/5438) | #5438 | — | Main MCU, WiFi, BT, NeoPixel |
 | [Adalogger FeatherWing](https://www.adafruit.com/product/2922) | #2922 | I2C + SPI | PCF8523 RTC + microSD |
 | [Ultimate GPS FeatherWing](https://www.adafruit.com/product/3133) | #3133 | UART | PA1616D GPS/GLONASS |
+| [FeatherWing OLED 128×64](https://www.adafruit.com/product/4650) | #4650 | I2C (0x3C) | SH1107 display + 3 nav buttons |
 
 ### Sensors
 
@@ -38,6 +39,12 @@ ESP32-based weather station with GPS timestamping, battery-backed RTC, and SD ca
 | GPS FeatherWing | RX → TX | 8 |
 | Built-in NeoPixel | Data | 0 |
 | BMP390 + SHTC3 | SDA/SCL | STEMMA QT |
+| RS485 MAX3485 | UART TX | A0 |
+| RS485 MAX3485 | UART RX | A1 |
+| RS485 MAX3485 | DE/~RE | D11 |
+| OLED FeatherWing #4650 | Button A (prev) | D9 |
+| OLED FeatherWing #4650 | Button B (next) | D6 |
+| OLED FeatherWing #4650 | Button C (redraw) | D5 |
 
 ### Hardware Notes
 
@@ -48,9 +55,10 @@ ESP32-based weather station with GPS timestamping, battery-backed RTC, and SD ca
 - **BMP390**: STEMMA QT I2C, default address `0x77`. Provides pressure (±3 Pa / ±0.25 m), temperature (±0.5 °C).
 - **SHTC3**: STEMMA QT I2C, fixed address `0x70`. Provides temperature (±0.2 °C) and humidity (±2 %RH). Chain via QT cable from BMP390 or directly from Feather V2 STEMMA QT port.
 - **HM3301**: Grove I2C, fixed address `0x40`. **Must run at ≤ 20 kHz I2C speed.** Allow 30 s warm-up. CRC failures and spurious values are common — the reader retries automatically.
-- **RS485 sensors (SEN0482/0483/0644)**: All share one RS485 bus via MAX3485 TTL module. Wired to a dedicated `busio.UART` + one GPIO for DE/~RE direction control. **SEN0482 and SEN0483 both default to Modbus address 0x02** — use `reader.set_address()` with each sensor connected alone to resolve the conflict before deploying on the shared bus.
+- **RS485 sensors (SEN0482/0483/0644)**: All share one RS485 bus via MAX3485 TTL module. Wired to a dedicated `busio.UART` on A0/A1 + GPIO D11 for DE/~RE direction control. **SEN0482 and SEN0483 both default to Modbus address 0x02** — use `reader.set_address()` with each sensor connected alone to resolve the conflict before deploying on the shared bus.
+- **OLED FeatherWing #4650**: SH1107 128×64 monochrome display on the shared I2C bus at address `0x3C`. Buttons A/B/C are hardwired to D9/D6/D5 on the FeatherWing PCB — A cycles back, B cycles forward through six sensor pages, C forces a redraw. The display is refreshed automatically after each sensor cycle.
 - **SEN0575**: Set DIP switch to I2C position before use. Fixed address `0x1D`. No official CircuitPython library — uses a ported raw I2C driver. Provides cumulative rainfall (mm), raw tip count, and uptime. Rolling 1-24 hour window available via `read_window(hours)`.
-- **I2C address map**: HM3301 `0x40`, PCF8523 `0x68`, SHTC3 `0x70`, BMP390 `0x77`, SEN0575 `0x1D` — no conflicts.
+- **I2C address map**: SEN0575 `0x1D`, HM3301 `0x40`, OLED SH1107 `0x3C`, PCF8523 `0x68`, SHTC3 `0x70`, BMP390 `0x77` — no conflicts.
 - **Power**: USB-C or LiPoly battery with built-in charging on the Feather V2.
 
 ## Setup
@@ -74,6 +82,7 @@ For WiFi-assisted workflows (`circup-install`, `deploy`), set **`ESP32_IP`** to 
 
 ```bash
 # Download latest CircuitPython .bin for ESP32 Feather V2 from circuitpython.org
+# wget https://downloads.circuitpython.org/bin/adafruit_feather_esp32_v2/en_US/adafruit-circuitpython-adafruit_feather_esp32_v2-en_US-<VER>.bin
 # then flash:
 poetry run esptool --chip esp32 --port /dev/ttyUSB0 write_flash -z 0x0 adafruit-circuitpython-adafruit_feather_esp32_v2-en_US-*.bin
 ```
@@ -88,7 +97,7 @@ After the board has joined Wi‑Fi with Web Workflow enabled, install Adafruit b
 poetry run circup-install
 ```
 
-This runs `circup install` for each `adafruit-circuitpython-*` dependency (host-only packages like Blinka/rshell are skipped). Override with **`--host`** / **`--password`** is not wired in this script—it always reads **`ESP32_IP`** and **`CIRCUITPY_WEB_API_PASSWORD`** from `settings.toml`.
+This extracts each `adafruit-circuitpython-*` dependency from the locally cached Adafruit CircuitPython Bundle (host-only packages like Blinka are skipped) and uploads them via Web Workflow. Override with **`--host`** / **`--password`** is not wired in this script—it always reads **`ESP32_IP`** and **`CIRCUITPY_WEB_API_PASSWORD`** from `settings.toml`. Use **`--serial`** for USB-serial install via mpremote when WiFi is unavailable.
 
 **USB mass storage**
 
@@ -149,7 +158,28 @@ poetry run deploy
 
 This runs **`pytest tests/ -v --tb=short`** first (no HTML coverage report; use `poetry run test` for coverage). After a clean run it PUTs **`code.py`** and every **`*.py`** under **`src/featherweather/`** to **`/fs/code.py`** and **`/fs/lib/featherweather/...`** on the board.
 
-### Deploy via USB mass storage
+### Deploy over USB-serial (`deploy --serial`)
+
+Use when WiFi is unavailable or the device is in a broken state. The Feather ESP32 V2 uses a CH340 USB-to-serial bridge (no native USB), so this is the only USB recovery path — there is no CIRCUITPY mass-storage drive on this board.
+
+```bash
+poetry run deploy --serial                       # default port /dev/ttyACM0
+poetry run deploy --serial --port /dev/ttyACM1   # non-default port
+poetry run deploy --serial --diagnostic          # diagnostic.py as code.py
+poetry run deploy --serial --sysmon              # sysmon.py as code.py
+```
+
+Uses **`mpremote`** (already a dev dependency) to push `settings.toml`, `boot.py`, `code.py`, and the `featherweather` package over the serial port.
+
+For an interactive REPL session over the same port:
+
+```bash
+poetry run mpremote connect /dev/ttyACM0 repl    # Ctrl+X to exit
+```
+
+### Deploy via USB mass storage (ESP32-S2/S3 only)
+
+The Feather ESP32 V2 does **not** expose a CIRCUITPY drive — this section applies only if you migrate to a board with native USB.
 
 ```bash
 # Copy the package to the device library folder
@@ -191,6 +221,7 @@ reader.set_address(0x03)
 code.py                 # device entry point → deploy to CIRCUITPY/
 src/featherweather/
 ├── __init__.py         # package root
+├── display/            # OLED FeatherWing [4650] - SH1107 128x64 + button nav
 ├── gps/                # Ultimate GPS FeatherWing [3133] - PA1616D UART
 ├── rtc/                # Adalogger FeatherWing [2922] - PCF8523 I2C
 ├── storage/            # Adalogger FeatherWing [2922] - microSD SPI
