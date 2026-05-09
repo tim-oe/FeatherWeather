@@ -1,16 +1,16 @@
 """boot.py — runs once before code.py on every boot.
 
-Two responsibilities:
-
+Responsibilities
+----------------
 1. Mount the Adalogger SD card at /sd for data storage.
 
-2. Seed CircuitPython's internal system clock from the PCF8523 RTC so that
-   FAT file timestamps are correct from the first write.
+2. Seed CircuitPython's internal clock from the PCF8523 RTC so that FAT
+   file timestamps are correct from the first write.
 
 Pin assignments (ESP32 Feather V2):
-    SPI  SCK / MOSI / MISO   board.SCK / board.MOSI / board.MISO
-    SPI  CS                  board.D33  (Feather "D10" slot → GPIO33)
-    I2C  SCL / SDA            board.SCL / board.SDA
+    SPI  SCK/MOSI/MISO   board.SCK/MOSI/MISO
+    SPI  CS              board.D33
+    I2C  SCL/SDA         board.SCL/board.SDA
 """
 
 import board
@@ -24,6 +24,10 @@ import adafruit_pcf8523.pcf8523 as _pcf8523
 _SD_CS_PIN = board.D33
 
 
+# ---------------------------------------------------------------------------
+# SD card
+# ---------------------------------------------------------------------------
+
 def _mount_sd() -> None:
     """Mount the SD card at /sd."""
     try:
@@ -36,6 +40,10 @@ def _mount_sd() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"boot: SD card mount failed: {exc}")
 
+
+# ---------------------------------------------------------------------------
+# RTC → system clock
+# ---------------------------------------------------------------------------
 
 def _sync_system_clock() -> None:
     """Read PCF8523 and set CircuitPython's internal clock so FAT timestamps are correct."""
@@ -52,6 +60,10 @@ def _sync_system_clock() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"boot: system clock sync failed: {exc}")
 
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
 
 _mount_sd()
 _sync_system_clock()

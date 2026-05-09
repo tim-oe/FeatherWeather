@@ -31,6 +31,14 @@ class TempHumidityReader:
         """
         self._sensor = adafruit_shtc3.SHTC3(i2c)
 
+    @classmethod
+    def verify(cls, i2c) -> "TempHumidityData":
+        """Instantiate, take one reading, and return the data.
+
+        Raises on any hardware or communication failure.
+        """
+        return cls(i2c).read()
+
     def read(self) -> TempHumidityData:
         """Read temperature and relative humidity from the SHTC3.
 

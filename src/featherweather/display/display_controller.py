@@ -1,6 +1,6 @@
 """OLED display controller for FeatherWeather.
 
-Drives the Adafruit 128×64 OLED FeatherWing #4650 (SH1107) with a six-page
+Drives the Adafruit 128×64 OLED FeatherWing #4650 (SH1107) with an eight-page
 scrolling UI controlled by three physical buttons on the wing.
 
 Button layout and function (buttons are stacked vertically on the wing):
@@ -40,6 +40,7 @@ _HEIGHT: int = 64
 _OLED_ADDR: int = 0x3C
 _WHITE: int = 0xFFFFFF
 _DEBOUNCE_S: float = 0.08
+_AUTO_OFF_S: float = 15.0  # blank display after this many seconds of inactivity
 
 # Label y-positions (pixels from top; terminalio.FONT glyphs are ~8 px tall)
 _Y_TITLE: int = 4
@@ -58,12 +59,19 @@ class DisplayState:
     """
 
     def __init__(self) -> None:
+        # Network
+        self.ip_address: str | None = None
         # GPS / status
         self.gps_has_fix: bool = False
         self.gps_satellites: int | None = None
         self.gps_utc_h: int | None = None
         self.gps_utc_m: int | None = None
         self.gps_utc_s: int | None = None
+        self.gps_utc_day: int | None = None
+        self.gps_utc_month: int | None = None
+        self.gps_utc_year: int | None = None
+        self.gps_latitude: float | None = None
+        self.gps_longitude: float | None = None
         self.gps_altitude_m: float | None = None
         # Temperature & Humidity (SHTC3)
         self.temp_c: float | None = None
@@ -86,6 +94,8 @@ class DisplayState:
         self.rain_window_mm: float | None = None
         # Illuminance (SEN0644)
         self.lux: float | None = None
+        # Sound level (SPH0645 I2S mic #3421)
+        self.db_spl: float | None = None
         # Monotonic timestamp of the last completed sensor cycle
         self.last_read_s: float | None = None
 
@@ -129,10 +139,9 @@ class DisplayController:
     """SH1107 OLED + three-button navigation controller.
 
     The constructor calls ``displayio.release_displays()`` before claiming the
-    display bus, so the caller does NOT need to do so beforehand.  The I2C bus
-    is obtained from ``board.STEMMA_I2C()`` (CircuitPython's shared singleton),
-    so callers that also need I2C for sensors should use the same call —
-    they will receive the same underlying bus object.
+    display bus.  The caller must call ``displayio.release_displays()`` before
+    creating the ``busio.I2C`` instance (to free SCL/SDA from any display left
+    active by the previous code.py run), then pass that bus here.
 
     Button actions:
         TOP    (C, board.A6) — advance to next page; turns display on if off
@@ -140,9 +149,9 @@ class DisplayController:
         BOTTOM (A, board.A8) — go to previous page; turns display on if off
     """
 
-    def __init__(self) -> None:
+    def __init__(self, i2c) -> None:
         displayio.release_displays()
-        display_bus = i2cdisplaybus.I2CDisplayBus(board.STEMMA_I2C(), device_address=_OLED_ADDR)
+        display_bus = i2cdisplaybus.I2CDisplayBus(i2c, device_address=_OLED_ADDR)
         self._display = SH1107(
             display_bus,
             width=_WIDTH,
@@ -152,25 +161,34 @@ class DisplayController:
         )
 
         # GPIOs run top-to-bottom as A6→A7→A8 (C→B→A) on the ESP32 Feather V2
-        self._btn_c = _make_button(board.A6)   # TOP    button C — next page      (GPIO37, input-only)
-        self._btn_b = _make_button(board.A7)   # MIDDLE button B — toggle display (GPIO32)
-        self._btn_a = _make_button(board.A8)   # BOTTOM button A — previous page  (GPIO15)
+        self._btn_c = _make_button(
+            board.A6
+        )  # TOP    button C — next page      (GPIO37, input-only)
+        self._btn_b = _make_button(
+            board.A7
+        )  # MIDDLE button B — toggle display (GPIO32)
+        self._btn_a = _make_button(
+            board.A8
+        )  # BOTTOM button A — previous page  (GPIO15)
 
         # Per-button state tracking (indexed: 0=C/top, 1=B/mid, 2=A/bottom)
         # _prev holds the last sampled value; True = released (pull-up idle high)
         self._prev: list[bool] = [True, True, True]
         self._dbn: list[float] = [0.0, 0.0, 0.0]
         self._display_on: bool = True
+        self._last_activity_s: float = time.monotonic()
 
         self.state = DisplayState()
         self._page: int = 0
         self._pages = [
             self._p_status,
+            self._p_gps_status,
             self._p_temp_humidity,
             self._p_pressure,
             self._p_air_quality,
             self._p_wind,
             self._p_rain_light,
+            self._p_sound,
         ]
 
     # ------------------------------------------------------------------
@@ -178,7 +196,9 @@ class DisplayController:
     # ------------------------------------------------------------------
 
     def render(self) -> None:
-        """Redraw the current page."""
+        """Redraw the current page. No-ops when the display is toggled off."""
+        if not self._display_on:
+            return
         self._pages[self._page]()
 
     def poll_buttons(self) -> None:
@@ -190,8 +210,17 @@ class DisplayController:
         TOP    (C, board.A6) — next page
         MIDDLE (B, board.A7) — toggle display on / off
         BOTTOM (A, board.A8) — previous page
+
+        Auto-off: the display blanks after _AUTO_OFF_S seconds of inactivity.
+        Any button press wakes it.
         """
         now = time.monotonic()
+
+        # Auto-off: blank the display after inactivity timeout
+        if self._display_on and (now - self._last_activity_s) >= _AUTO_OFF_S:
+            self._display_on = False
+            self._display.root_group = displayio.Group()
+
         buttons = (self._btn_c, self._btn_b, self._btn_a)  # top → mid → bottom
         for i, btn in enumerate(buttons):
             val = btn.value
@@ -200,17 +229,18 @@ class DisplayController:
             if not pressed or (now - self._dbn[i]) < _DEBOUNCE_S:
                 continue
             self._dbn[i] = now
-            if i == 0:                          # TOP (C) — next page
+            self._last_activity_s = now  # any press resets the inactivity timer
+            if i == 0:  # TOP (C) — next page
                 self._display_on = True
                 self._page = (self._page + 1) % len(self._pages)
                 self.render()
-            elif i == 1:                        # MIDDLE (B) — toggle on/off
+            elif i == 1:  # MIDDLE (B) — toggle on/off
                 self._display_on = not self._display_on
                 if self._display_on:
                     self.render()
                 else:
                     self._display.root_group = displayio.Group()
-            else:                               # BOTTOM (A) — previous page
+            else:  # BOTTOM (A) — previous page
                 self._display_on = True
                 self._page = (self._page - 1) % len(self._pages)
                 self.render()
@@ -221,24 +251,43 @@ class DisplayController:
 
     def _p_status(self) -> None:
         s = self.state
-        fix = "FIX" if s.gps_has_fix else "no fix"
-        sats = f" ({s.gps_satellites} sats)" if s.gps_satellites is not None else ""
+        ip = s.ip_address if s.ip_address is not None else "---"
+        date = (
+            f"{s.gps_utc_year:04d}-{s.gps_utc_month:02d}-{s.gps_utc_day:02d}"
+            if s.gps_has_fix and s.gps_utc_year is not None
+            else "---"
+        )
         utc = (
-            f"UTC: {s.gps_utc_h:02d}:{s.gps_utc_m:02d}:{s.gps_utc_s:02d}"
+            f"{s.gps_utc_h:02d}:{s.gps_utc_m:02d}:{s.gps_utc_s:02d} UTC"
             if s.gps_has_fix and s.gps_utc_h is not None
-            else "UTC: ---"
+            else "---"
         )
         age = (
-            f"Upd: {int(time.monotonic() - s.last_read_s)}s ago"
+            f"{int(time.monotonic() - s.last_read_s)}s ago"
             if s.last_read_s is not None
-            else "Upd: waiting..."
+            else "waiting..."
         )
         self._draw(
             "STATUS",
-            f"GPS: {fix}{sats}",
-            utc,
-            f"Alt: {_fmt(s.gps_altitude_m, '{:.1f} m')}",
-            age,
+            f"IP:   {ip}",
+            f"Date: {date}",
+            f"Time: {utc}",
+            f"Upd:  {age}",
+        )
+
+    def _p_gps_status(self) -> None:
+        s = self.state
+        fix = "FIX" if s.gps_has_fix else "no fix"
+        sats = _fmt(s.gps_satellites, "{}")
+        lat = _fmt(s.gps_latitude, "{:.5f}")
+        lon = _fmt(s.gps_longitude, "{:.5f}")
+        alt = _fmt(s.gps_altitude_m, "{:.1f} m")
+        self._draw(
+            "GPS",
+            f"Status: {fix}  {sats} sats",
+            f"Lat:    {lat}",
+            f"Lon:    {lon}",
+            f"Alt:    {alt}",
         )
 
     def _p_temp_humidity(self) -> None:
@@ -289,6 +338,27 @@ class DisplayController:
             f"Total: {_fmt(s.rain_cumulative_mm, '{:.2f} mm')}",
             f"1hr:   {_fmt(s.rain_window_mm, '{:.2f} mm')}",
             f"Light: {_fmt(s.lux, '{:.0f} lux')}",
+        )
+
+    def _p_sound(self) -> None:
+        s = self.state
+        # Qualitative label based on standard dB SPL ranges
+        if s.db_spl is None:
+            label = "---"
+        elif s.db_spl < 30:
+            label = "Very quiet"
+        elif s.db_spl < 50:
+            label = "Quiet"
+        elif s.db_spl < 70:
+            label = "Moderate"
+        elif s.db_spl < 85:
+            label = "Loud"
+        else:
+            label = "Very loud"
+        self._draw(
+            "SOUND LEVEL",
+            f"dB SPL: {_fmt(s.db_spl, '{:.1f} dB')}",
+            f"Level:  {label}",
         )
 
     # ------------------------------------------------------------------

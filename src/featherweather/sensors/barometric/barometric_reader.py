@@ -59,6 +59,15 @@ class BarometricReader:
         data.temperature = self._sensor.temperature
         return data
 
+    @classmethod
+    def verify(cls, i2c) -> "BarometricData":
+        """Instantiate, take one reading, and return the data.
+
+        Raises on any hardware or communication failure so the caller can
+        treat exceptions as a verification failure.
+        """
+        return cls(i2c).read()
+
     @staticmethod
     def sea_level_pressure_from_altitude(
         pressure_hpa: float, altitude_m: float

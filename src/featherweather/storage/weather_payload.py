@@ -10,14 +10,14 @@ Usage:
     json_str = payload.to_json()
 """
 
-from featherweather.sensors.barometric.barometric_data import BarometricData
-from featherweather.sensors.temp_humidity.temp_humidity_data import TempHumidityData
+from featherweather.gps.gps_data import GpsData
 from featherweather.sensors.air_quality.air_quality_data import AirQualityData
+from featherweather.sensors.barometric.barometric_data import BarometricData
+from featherweather.sensors.illuminance.illuminance_data import IlluminanceData
 from featherweather.sensors.rainfall.rainfall_data import RainfallData
+from featherweather.sensors.temp_humidity.temp_humidity_data import TempHumidityData
 from featherweather.sensors.wind_direction.wind_direction_data import WindDirectionData
 from featherweather.sensors.wind_speed.wind_speed_data import WindSpeedData
-from featherweather.sensors.illuminance.illuminance_data import IlluminanceData
-from featherweather.gps.gps_data import GpsData
 from featherweather.storage.serializer import to_json
 
 __all__ = ["WeatherPayload"]

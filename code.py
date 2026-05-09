@@ -39,16 +39,19 @@ import adafruit_sdcard
 import board
 import busio
 import digitalio
+import displayio
 import storage
 
 from featherweather.display.display_controller import DisplayController
 from featherweather.gps.gps_reader import GpsReader
 from featherweather.rtc.rtc_sync import sync_rtc_from_ntp
+from featherweather.storage.sd_file_server import SdFileServer
 from featherweather.sensors.air_quality.air_quality_reader import AirQualityReader
 from featherweather.sensors.barometric.barometric_reader import BarometricReader
 from featherweather.sensors.illuminance.illuminance_reader import IlluminanceReader
 from featherweather.sensors.rainfall.rainfall_reader import RainfallReader
 from featherweather.sensors.temp_humidity.temp_humidity_reader import TempHumidityReader
+from featherweather.sensors.microphone.microphone_reader import MicrophoneReader
 from featherweather.sensors.wind_direction.wind_direction_reader import WindDirectionReader
 from featherweather.sensors.wind_speed.wind_speed_reader import WindSpeedReader
 
@@ -135,10 +138,15 @@ def _poll_gps(gps: GpsReader, display: DisplayController) -> None:
     display.state.gps_has_fix = data.has_fix
     display.state.gps_satellites = data.satellites
     display.state.gps_altitude_m = data.altitude_m
+    display.state.gps_latitude = data.latitude
+    display.state.gps_longitude = data.longitude
     if data.timestamp_utc is not None:
         display.state.gps_utc_h = data.timestamp_utc.tm_hour
         display.state.gps_utc_m = data.timestamp_utc.tm_min
         display.state.gps_utc_s = data.timestamp_utc.tm_sec
+        display.state.gps_utc_day = data.timestamp_utc.tm_mday
+        display.state.gps_utc_month = data.timestamp_utc.tm_mon
+        display.state.gps_utc_year = data.timestamp_utc.tm_year
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +163,7 @@ def _run_sensor_cycle(
     wind_dir,
     wind_spd,
     illum,
+    mic,
     display: DisplayController,
 ) -> None:
     """Read all available sensors sequentially and refresh the display.
@@ -235,6 +244,14 @@ def _run_sensor_cycle(
         except Exception as exc:  # noqa: BLE001
             print(f"illuminance error: {exc}")
 
+    if mic is not None:
+        try:
+            data = mic.read()
+            print(data)
+            display.state.db_spl = data.db_spl
+        except Exception as exc:  # noqa: BLE001
+            print(f"mic error: {exc}")
+
     display.state.last_read_s = time.monotonic()
     display.render()
 
@@ -245,26 +262,40 @@ def _run_sensor_cycle(
 
 
 def main() -> None:
-    # OLED — must be first: DisplayController calls displayio.release_displays()
-    # internally before claiming the I2C bus, which frees SCL/SDA from any
-    # display left active by the previous code.py run.
-    display = DisplayController()
+    # Release any display left active by the previous code.py run.
+    # This must happen before busio.I2C() is created — the previous run's
+    # I2CDisplayBus holds SCL/SDA until release_displays() is called.
+    displayio.release_displays()
+
+    # Shared I2C bus for display + all I2C sensors
+    i2c = busio.I2C(board.SCL, board.SDA)
+
+    # OLED FeatherWing #4650 — DisplayController also calls release_displays()
+    # internally (harmless second call) then claims the display bus.
+    display = DisplayController(i2c)
     display.render()
 
-    # Shared I2C bus — board.STEMMA_I2C() returns the same singleton that
-    # DisplayController already initialised, so no pin conflict occurs.
-    i2c = board.STEMMA_I2C()
-
-    # SD card — mounted in boot.py; re-mount here in case boot.py mount was torn down
+    # SD card — boot.py and code.py run in separate Python VMs.  boot.py's
+    # C-level VFS registration at /sd persists across the VM boundary, but its
+    # underlying SPI peripheral is released when the boot VM ends.  That leaves
+    # a stale mount whose block reads silently return empty data.  Fix: always
+    # umount any stale /sd entry before creating a fresh, live mount.
+    _sd_spi = _sd_cs = _sdcard = _sd_vfs = None
     try:
-        spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
-        cs = digitalio.DigitalInOut(board.D33)
-        sdcard = adafruit_sdcard.SDCard(spi, cs)
-        vfs = storage.VfsFat(sdcard)
-        storage.mount(vfs, "/sd")
-        print("SD card mounted at /sd")
-    except Exception as exc:  # noqa: BLE001
-        print(f"SD card mount failed (may already be mounted): {exc}")
+        storage.umount("/sd")
+        print("SD card: removed stale /sd mount")
+    except OSError:
+        pass  # not mounted — nothing to clean up
+    try:
+        _sd_spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
+        _sd_cs  = digitalio.DigitalInOut(board.D33)
+        _sdcard = adafruit_sdcard.SDCard(_sd_spi, _sd_cs)
+        _sd_vfs = storage.VfsFat(_sdcard)
+        storage.mount(_sd_vfs, "/sd")
+        _sd_entries = os.listdir("/sd")
+        print(f"SD card mounted at /sd — {len(_sd_entries)} file(s)")
+    except OSError as exc:
+        print(f"SD card mount failed: {exc}")
 
     # RTC — PCF8523 on Adalogger FeatherWing; sync time from NTP on every boot
     rtc = _pcf8523_mod.PCF8523(i2c)
@@ -297,6 +328,9 @@ def main() -> None:
     aq       = _try_init("HM3301  (air quality)",   lambda: AirQualityReader(i2c))
     rain     = _try_init("SEN0575 (rainfall)",      lambda: RainfallReader(i2c))
 
+    # I2S microphone — None if audiobusio.I2SIn is unsupported on this build
+    mic = _try_init("SPH0645 (microphone)",     lambda: MicrophoneReader())
+
     # RS485 sensor readers — each is None if the UART setup failed or sensor absent
     if rs485_uart is not None and de_pin is not None:
         wind_dir = _try_init(
@@ -314,10 +348,22 @@ def main() -> None:
     else:
         wind_dir = wind_spd = illum = None
 
+    # SD file server — non-blocking HTTP server on port 8080 for /sd/ access
+    # Allows fetch-sd to pull files while code.py is running (no reboot needed)
+    try:
+        import wifi as _wifi  # noqa: PLC0415
+        sd_server = SdFileServer(_wifi.radio, port=8080)
+        ip = _wifi.radio.ipv4_address
+        display.state.ip_address = str(ip) if ip is not None else None
+        print(f"[init] IP address: {display.state.ip_address}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[init] SD file server SKIPPED ({exc})")
+        sd_server = None
+
     print("FeatherWeather ready")
 
     # Read sensors immediately so the display shows live data from the first button press
-    _run_sensor_cycle(rtc, baro, temp_hum, aq, rain, wind_dir, wind_spd, illum, display)
+    _run_sensor_cycle(rtc, baro, temp_hum, aq, rain, wind_dir, wind_spd, illum, mic, display)
 
     # Schedule subsequent reads at fixed interval boundaries
     next_read_mono = time.monotonic() + _seconds_until_next_interval(rtc)
@@ -339,9 +385,13 @@ def main() -> None:
         # Buttons — polled every loop iteration (~20 Hz)
         display.poll_buttons()
 
+        # SD file server — accept one pending HTTP connection if any
+        if sd_server is not None:
+            sd_server.poll()
+
         # Sensor cycle — fires when the next interval boundary is reached
         if now_mono >= next_read_mono:
-            _run_sensor_cycle(rtc, baro, temp_hum, aq, rain, wind_dir, wind_spd, illum, display)
+            _run_sensor_cycle(rtc, baro, temp_hum, aq, rain, wind_dir, wind_spd, illum, mic, display)
             next_read_mono = time.monotonic() + _seconds_until_next_interval(rtc)
             now = rtc.datetime
             print(

@@ -36,3 +36,4 @@ sending.jsonl
 
 # bin files for firmware flashing
 *.bin
+device_files/

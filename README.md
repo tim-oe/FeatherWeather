@@ -58,11 +58,15 @@ The breakout has six through-holes. Suggested cable colors:
 | Pin (breakout) | Wire color | Connect to |
 |----------------|-----------|------------|
 | 3V             | red       | 3V on Feather |
-| GND            | green     | GND on Feather |
+| GND            | green     | GND on Feather (the single GND header pin) |
 | BCLK           | yellow    | D27 (GPIO27) |
-| DOUT           | white     | A2 |
-| LRCL           | orange    | D13 |
-| SEL            | blue      | GND on Feather (left-channel data on LRCL low; tie to 3V for right channel) |
+| DOUT           | white     | A2 (GPIO34, input-only) |
+| LRCL           | orange    | D13 (GPIO13 — labeled **led** in the pinout PDF; `board.D13` in CircuitPython) |
+| SEL            | —         | **Bridge to GND on the breakout PCB** with a short jumper wire (see note below) |
+
+> **GND / SEL note:** The Feather V2 exposes only one GND header pin. Rather than running two ground wires to the board, solder a short wire directly between the `SEL` and `GND` through-holes on the mic breakout. This selects left-channel output and leaves only five wires running to the Feather. Tie `SEL` to `3V` on the breakout instead if you want right-channel output.
+>
+> **D13 / "led" pin note:** The pinout PDF labels this pin **led** (primary) with GPIO13 as the secondary label. In CircuitPython it is `board.D13` (also `board.LED`). It is the fourth signal pin on the top row: BAT → EN → USB → **led/GPIO13** → 12 → 27 → 33 → 15 → 32 → 14 → SCL → SDA. The red LED is driven by this pin — it will mirror the LRCL signal while audio is running, which is harmless.
 
 ### Hardware Notes
 
@@ -75,7 +79,7 @@ The breakout has six through-holes. Suggested cable colors:
 - **HM3301**: Grove I2C, fixed address `0x40`. **Must run at ≤ 20 kHz I2C speed.** Allow 30 s warm-up. CRC failures and spurious values are common — the reader retries automatically.
 - **RS485 sensors (SEN0482/0483/0644)**: All share one RS485 bus via MAX3485 TTL module. Wired to a dedicated `busio.UART` on A0/A1 + `D12` (GPIO12) for DE/~RE direction control. D12 is a strapping pin (must be LOW at power-on) but is safe here because DE defaults LOW (receive mode) in the driver. A0 and A1 are at the far end of the 16-pin bottom row; D12 is at the far end of the 12-pin top row — directly across the board, the closest available output-capable pin. **SEN0482 and SEN0483 both default to Modbus address 0x02** — use `reader.set_address()` with each sensor connected alone to resolve the conflict before deploying on the shared bus.
 - **OLED FeatherWing #4650**: SH1107 128×64 monochrome display on the shared I2C bus at address `0x3C`. Three buttons are stacked vertically on the wing — TOP (C) advances to the next page, MIDDLE (B) forces a redraw, BOTTOM (A) goes back. Board pins are `A8`/`A7`/`A6` (GPIO15/32/37) on the Feather ESP32 V2 — the FeatherWing PCB labels them "5"/"6"/"9" but those Feather header positions map to different GPIO names on ESP32 than on SAMD/RP2040. The display is refreshed automatically after each sensor cycle.
-- **I2S MEMS Microphone #3421**: SPH0645LM4H-LB on a 6-pin breakout. **CircuitPython on the ESP32 does not implement `audiobusio.I2SIn`** (output-only) — the mic is wired up but cannot be read until the device is moved to MicroPython, ESP-IDF, or a future CircuitPython release with I2S input support. Pins chosen to avoid strapping conflicts: `D27` (BCLK, GPIO27), `D13` (LRCL/WS, GPIO13 — shared with built-in LED, which is fine when audio is running), `A2` (DOUT, GPIO34 input-only — ideal for a signal flowing mic→MCU). `SEL` is tied off statically rather than wired to a GPIO; pull to GND for left-channel data on LRCL low or to 3V for right channel. Note: `board.D10` does not exist on the ESP32 Feather V2 — use `board.D27` for BCLK.
+- **I2S MEMS Microphone #3421**: SPH0645LM4H-LB on a 6-pin breakout. **Not supported in the stock CircuitPython 10.2.0 ESP32 firmware**, but support is imminent: [PR #10990](https://github.com/adafruit/circuitpython/pull/10990) (opened May 8 2026, by a CircuitPython collaborator) adds a new `audio_i2sin.I2SIn` class for both Espressif and RP2040 ports and was tested on an ESP32 Huzzah Feather. To use the mic now, flash a **nightly/dev build** from [circuitpython.org/board/adafruit_feather_esp32_v2](https://circuitpython.org/board/adafruit_feather_esp32_v2/) once PR #10990 is merged. Until then, `MicrophoneReader` raises `NotImplementedError` at import time and is silently skipped by `code.py`; the SOUND LEVEL display page shows `---`. Pins: `D27` (BCLK, GPIO27), `D13` (LRCL/WS, GPIO13 — labeled **led** in the pinout PDF, also drives the red LED, harmless during audio), `A2` (DOUT, GPIO34 input-only). `SEL` is bridged to `GND` on the breakout PCB (left channel) — the Feather has only one GND header pin so both grounds are satisfied at the breakout side.
 - **SEN0575**: Set DIP switch to I2C position before use. Fixed address `0x1D`. No official CircuitPython library — uses a ported raw I2C driver. Provides cumulative rainfall (mm), raw tip count, and uptime. Rolling 1-24 hour window available via `read_window(hours)`.
 - **I2C address map**: SEN0575 `0x1D`, HM3301 `0x40`, OLED SH1107 `0x3C`, PCF8523 `0x68`, SHTC3 `0x70`, BMP390 `0x77` — no conflicts.
 - **Power**: USB-C or LiPoly battery with built-in charging on the Feather V2.

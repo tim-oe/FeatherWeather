@@ -29,7 +29,7 @@ _I2C_ADDR: int = 0x40
 _SELECT_CMD: bytes = bytes([0x88])
 _DATA_LEN: int = 29
 _DEFAULT_RETRY: int = 5
-_DEFAULT_WAIT_SEC: float = 0.2   # 200 ms — HM3301 needs time between cmd and read
+_DEFAULT_WAIT_SEC: float = 0.2  # 200 ms — HM3301 needs time between cmd and read
 _CEILING: int = 500
 
 
@@ -49,6 +49,19 @@ class AirQualityReader:
         bytes [12:14] PM2.5 atmospheric ug/m3
         bytes [14:16] PM10  atmospheric ug/m3
     """
+
+    _VERIFY_WARMUP_S: float = 3.0  # HM3301 needs a few seconds after power-on
+
+    @classmethod
+    def verify(cls, i2c) -> "AirQualityData":
+        """Wait for sensor warmup, instantiate, take one reading, and return the data.
+
+        Raises on any hardware or communication failure.
+        """
+        import time  # noqa: PLC0415
+
+        time.sleep(cls._VERIFY_WARMUP_S)
+        return cls(i2c, retry=8, wait_sec=0.3).read()
 
     def __init__(
         self,

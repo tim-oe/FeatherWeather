@@ -14,6 +14,7 @@ Hardware checked
     SHTC3        temperature / humidity             I2C 0x70
     PCF8523      Adalogger FeatherWing RTC          I2C 0x68
     SH1107       OLED FeatherWing #4650 128×64      I2C 0x3C
+    SPH0645      I2S MEMS microphone #3421          I2S (D27/D13/A2)
     Ultimate GPS UART NMEA activity + optional fix  board.TX / board.RX
     SD card      Adalogger FeatherWing SPI storage  board.D10 CS
 
@@ -30,6 +31,21 @@ import time
 
 import board
 import busio
+import digitalio
+import displayio
+import i2cdisplaybus
+import terminalio
+from adafruit_display_text import label
+from adafruit_displayio_sh1107 import DISPLAY_OFFSET_ADAFRUIT_FEATHERWING_OLED_4650, SH1107
+from adafruit_pcf8523.pcf8523 import PCF8523
+
+from featherweather.gps.gps_reader import GpsReader
+from featherweather.rtc.rtc_sync import sync_rtc_from_ntp
+from featherweather.sensors.air_quality.air_quality_reader import AirQualityReader
+from featherweather.sensors.barometric.barometric_reader import BarometricReader
+from featherweather.sensors.microphone.microphone_reader import MicrophoneReader
+from featherweather.sensors.rainfall.rainfall_reader import RainfallReader
+from featherweather.sensors.temp_humidity.temp_humidity_reader import TempHumidityReader
 
 # ---------------------------------------------------------------------------
 # Optional library imports — loaded lazily inside each check function so a
@@ -454,17 +470,16 @@ def _check_system() -> None:
 def _check_rtc(i2c):
     _section("PCF8523 RTC (Adalogger FeatherWing)")
     try:
-        from adafruit_pcf8523.pcf8523 import PCF8523  # noqa: PLC0415
         rtc = PCF8523(i2c)
         dt = rtc.datetime
         ts = (
             f"{dt.tm_year}-{dt.tm_mon:02d}-{dt.tm_mday:02d}"
             f" {dt.tm_hour:02d}:{dt.tm_min:02d}:{dt.tm_sec:02d}"
         )
-        _result("PCF8523 init + read", True, ts)
+        _result("PCF8523", True, ts)
         return rtc
     except Exception as exc:  # noqa: BLE001
-        _result("PCF8523 init + read", False, str(exc))
+        _result("PCF8523", False, str(exc))
         return None
 
 
@@ -479,13 +494,10 @@ def _check_ntp(rtc) -> bool:
         _result("NTP sync", False, "skipped — RTC not available")
         return False
     try:
-        from featherweather.rtc.rtc_sync import sync_rtc_from_ntp  # noqa: PLC0415
         ok = sync_rtc_from_ntp(rtc, tz_offset=_NTP_TZ_OFFSET)
         if ok:
             _result("NTP sync", True, "")
             return True
-        # On failure, dump the WiFi state so we know where to point the finger:
-        # bad credentials? no gateway? blocked outbound UDP/123?
         try:
             import wifi  # noqa: PLC0415
             if not wifi.radio.connected:
@@ -529,67 +541,51 @@ def _scan_i2c(i2c) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Sensor checks
+# Sensor checks — each delegates all sensor logic to SensorClass.verify()
 # ---------------------------------------------------------------------------
 
 
 def _check_bmp390(i2c):
     _section("BMP390 Barometric Sensor")
     try:
-        from featherweather.sensors.barometric.barometric_reader import BarometricReader  # noqa: PLC0415
-        reader = BarometricReader(i2c)
-        data = reader.read()
-        _result(
-            "BMP390 init + read",
-            True,
-            f"pressure={data.pressure:.2f} hPa  temp={data.temperature:.2f} C",
-        )
+        data = BarometricReader.verify(i2c)
+        _result("BMP390", True, f"pressure={data.pressure:.2f} hPa  temp={data.temperature:.2f} C")
         return data
     except Exception as exc:  # noqa: BLE001
-        _result("BMP390 init + read", False, str(exc))
+        _result("BMP390", False, str(exc))
         return None
 
 
 def _check_shtc3(i2c):
     _section("SHTC3 Temperature / Humidity Sensor")
     try:
-        from featherweather.sensors.temp_humidity.temp_humidity_reader import TempHumidityReader  # noqa: PLC0415
-        reader = TempHumidityReader(i2c)
-        data = reader.read()
-        _result(
-            "SHTC3 init + read",
-            True,
-            f"temp={data.temperature:.2f} C  humidity={data.relative_humidity:.1f} %RH",
-        )
+        data = TempHumidityReader.verify(i2c)
+        _result("SHTC3", True, f"temp={data.temperature:.2f} C  hum={data.relative_humidity:.1f} %RH")
         return data
     except Exception as exc:  # noqa: BLE001
-        _result("SHTC3 init + read", False, str(exc))
+        _result("SHTC3", False, str(exc))
         return None
 
 
 def _check_hm3301(i2c):
     _section("HM3301 Air Quality Sensor")
+    _log(f"  Waiting {AirQualityReader._VERIFY_WARMUP_S:.0f}s for warmup …")
     try:
-        from featherweather.sensors.air_quality.air_quality_reader import AirQualityReader  # noqa: PLC0415
-        # HM3301 needs a few seconds to stabilize after power-on before
-        # it produces valid CRC-passing frames.
-        _log("  Waiting 3s for HM3301 warmup …")
-        time.sleep(3.0)
-        reader = AirQualityReader(i2c, retry=8, wait_sec=0.3)
-        data = reader.read()
-        _result(
-            "HM3301 init + read",
-            True,
-            (
-                f"PM1.0={data.pm_1_0_atm} "
-                f"PM2.5={data.pm_2_5_atm} "
-                f"PM10={data.pm_10_atm} ug/m3"
-            ),
-        )
+        data = AirQualityReader.verify(i2c)
+        _result("HM3301", True,
+                f"PM1.0={data.pm_1_0_atm}  PM2.5={data.pm_2_5_atm}  PM10={data.pm_10_atm} ug/m3")
         return data
     except Exception as exc:  # noqa: BLE001
-        _result("HM3301 init + read", False, str(exc))
+        _result("HM3301", False, str(exc))
         return None
+
+
+def _check_mic():
+    # Skipped until CircuitPython PR #10990 (audio_i2sin.I2SIn) merges and a
+    # nightly/stable build is available for the ESP32 Feather V2.
+    _section("SPH0645 I2S MEMS Microphone #3421")
+    _log("  [SKIP] audio_i2sin not in stock 10.2.0 — awaiting PR #10990")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -598,23 +594,10 @@ def _check_hm3301(i2c):
 
 
 def _check_oled(i2c):
-    """Initialise the SH1107 display and render a diagnostic splash screen.
-
-    Stores the live display object in ``_oled_display`` so that
-    ``_update_oled_summary()`` can refresh it with the final pass/fail counts.
-    """
+    """Initialise the SH1107 display and render a diagnostic splash screen."""
     global _oled_display  # noqa: PLW0603
     _section("OLED FeatherWing #4650 (SH1107 128x64)")
     try:
-        import displayio                          # noqa: PLC0415
-        import i2cdisplaybus                      # noqa: PLC0415
-        import terminalio                         # noqa: PLC0415
-        from adafruit_display_text import label   # noqa: PLC0415
-        from adafruit_displayio_sh1107 import (  # noqa: PLC0415
-            DISPLAY_OFFSET_ADAFRUIT_FEATHERWING_OLED_4650,
-            SH1107,
-        )
-
         displayio.release_displays()
         display_bus = i2cdisplaybus.I2CDisplayBus(i2c, device_address=0x3C)
         display = SH1107(
@@ -624,48 +607,36 @@ def _check_oled(i2c):
             display_offset=DISPLAY_OFFSET_ADAFRUIT_FEATHERWING_OLED_4650,
             rotation=270,
         )
-
         group = displayio.Group()
-        group.append(label.Label(terminalio.FONT, text="FeatherWeather", x=0, y=6,  color=0xFFFFFF))
-        group.append(label.Label(terminalio.FONT, text="DIAG MODE",      x=0, y=20, color=0xFFFFFF))
-        group.append(label.Label(terminalio.FONT, text="I2C 0x3C  OK",   x=0, y=34, color=0xFFFFFF))
-        group.append(label.Label(terminalio.FONT, text="Running checks..",x=0, y=48, color=0xFFFFFF))
+        group.append(label.Label(terminalio.FONT, text="FeatherWeather",  x=0, y=6,  color=0xFFFFFF))
+        group.append(label.Label(terminalio.FONT, text="DIAG MODE",       x=0, y=20, color=0xFFFFFF))
+        group.append(label.Label(terminalio.FONT, text="I2C 0x3C  OK",    x=0, y=34, color=0xFFFFFF))
+        group.append(label.Label(terminalio.FONT, text="Running checks..", x=0, y=48, color=0xFFFFFF))
         display.root_group = group
-
-        _result("SH1107 init + render", True, "I2C 0x3C, 128x64")
+        _result("SH1107", True, "I2C 0x3C, 128x64, rotation=270")
         _oled_display = display
         return display
     except Exception as exc:  # noqa: BLE001
-        _result("SH1107 init + render", False, str(exc))
+        _result("SH1107", False, str(exc))
         return None
 
 
 def _update_oled_summary(passed: int, failed: int) -> None:
-    """Overwrite the OLED splash with the final pass/fail summary.
-
-    No-ops silently if the display was not initialised (OLED check failed or
-    the display is not connected).
-    """
+    """Overwrite the OLED splash with the final pass/fail summary."""
     if _oled_display is None:
         return
     try:
-        import displayio                         # noqa: PLC0415
-        import terminalio                        # noqa: PLC0415
-        from adafruit_display_text import label  # noqa: PLC0415
-
         total = passed + failed
         status = "ALL PASS" if failed == 0 else f"{failed}/{total} FAIL"
-        color = 0xFFFFFF
-
         group = displayio.Group()
-        group.append(label.Label(terminalio.FONT, text="FeatherWeather", x=0, y=6,  color=color))
-        group.append(label.Label(terminalio.FONT, text="DIAG COMPLETE",  x=0, y=20, color=color))
-        group.append(label.Label(terminalio.FONT, text=f"Pass: {passed}", x=0, y=34, color=color))
-        group.append(label.Label(terminalio.FONT, text=f"Fail: {failed}", x=0, y=48, color=color))
-        group.append(label.Label(terminalio.FONT, text=status,            x=0, y=58, color=color))
+        group.append(label.Label(terminalio.FONT, text="FeatherWeather",  x=0, y=6,  color=0xFFFFFF))
+        group.append(label.Label(terminalio.FONT, text="DIAG COMPLETE",   x=0, y=20, color=0xFFFFFF))
+        group.append(label.Label(terminalio.FONT, text=f"Pass: {passed}", x=0, y=34, color=0xFFFFFF))
+        group.append(label.Label(terminalio.FONT, text=f"Fail: {failed}", x=0, y=48, color=0xFFFFFF))
+        group.append(label.Label(terminalio.FONT, text=status,            x=0, y=58, color=0xFFFFFF))
         _oled_display.root_group = group
     except Exception:  # noqa: BLE001
-        pass  # display update is best-effort in diagnostic mode
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -706,8 +677,7 @@ def _done_loop(_i2c) -> None:
     blank_group = None
     if _oled_display is not None:
         try:
-            import displayio  # noqa: PLC0415
-            blank_group = displayio.Group()  # empty group → all pixels off on OLED
+            blank_group = displayio.Group()
             _oled_display.root_group = blank_group
         except Exception:  # noqa: BLE001
             blank_group = None
@@ -723,20 +693,16 @@ def _done_loop(_i2c) -> None:
         ("BOTTOM (A)", "A6"),   # GPIO37 — input-only, rely on external pull-up
     ]
     buttons = []
-    try:
-        import digitalio  # noqa: PLC0415
-        for btn_label, pin_name in _BTN_DEFS:
+    for btn_label, pin_name in _BTN_DEFS:
+        try:
+            dio = digitalio.DigitalInOut(getattr(board, pin_name))
             try:
-                dio = digitalio.DigitalInOut(getattr(board, pin_name))
-                try:
-                    dio.switch_to_input(pull=digitalio.Pull.UP)
-                except (ValueError, AttributeError):
-                    dio.switch_to_input(pull=None)  # input-only GPIO
-                buttons.append((btn_label, dio))
-            except Exception:  # noqa: BLE001
-                pass
-    except Exception:  # noqa: BLE001
-        pass
+                dio.switch_to_input(pull=digitalio.Pull.UP)
+            except (ValueError, AttributeError):
+                dio.switch_to_input(pull=None)  # input-only GPIO
+            buttons.append((btn_label, dio))
+        except Exception:  # noqa: BLE001
+            pass
 
     last_press = time.monotonic()
     while True:
@@ -758,78 +724,47 @@ def _done_loop(_i2c) -> None:
 
 
 # ---------------------------------------------------------------------------
-# GPS check — uses adafruit_gps directly to keep the diagnostic self-contained
+# GPS check
 # ---------------------------------------------------------------------------
-
-# NMEA sentences: GGA (position/altitude) + RMC (speed/heading/time) only
-_PMTK_SET_NMEA_OUTPUT = b"PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0"
-_PMTK_SET_UPDATE_RATE = b"PMTK220,1000"
 
 
 def _check_gps():
     _section("Ultimate GPS FeatherWing")
-
+    _log(f"  NMEA timeout={_GPS_NMEA_CHECK_S:.0f}s  fix timeout={_GPS_FIX_TIMEOUT_S:.0f}s")
     try:
-        import adafruit_gps  # noqa: PLC0415
         uart = busio.UART(board.TX, board.RX, baudrate=_GPS_BAUD, timeout=0.1)
-        gps = adafruit_gps.GPS(uart, debug=False)
-        gps.send_command(_PMTK_SET_NMEA_OUTPUT)
-        gps.send_command(_PMTK_SET_UPDATE_RATE)
-        _result("GPS UART init", True)
+        data = GpsReader.verify(
+            uart,
+            nmea_timeout_s=_GPS_NMEA_CHECK_S,
+            fix_timeout_s=_GPS_FIX_TIMEOUT_S,
+        )
+    except RuntimeError as exc:
+        # RuntimeError from verify() means no NMEA — real wiring problem
+        _result("GPS NMEA activity", False, str(exc))
+        return None, False
     except Exception as exc:  # noqa: BLE001
         _result("GPS UART init", False, str(exc))
-        return None, None
+        return None, False
 
-    # Confirm the GPS module is alive by watching for a parsed NMEA sentence
-    _log(f"  Checking for NMEA sentences ({_GPS_NMEA_CHECK_S:.0f}s) …")
-    nmea_seen = False
-    deadline = time.monotonic() + _GPS_NMEA_CHECK_S
-    while time.monotonic() < deadline:
-        if gps.update():
-            nmea_seen = True
-            break
-        time.sleep(0.1)
+    _result("GPS NMEA activity", True)
 
-    _result(
-        "GPS NMEA activity",
-        nmea_seen,
-        "" if nmea_seen else "no sentences received — check antenna/wiring",
-    )
-
-    # Attempt a fix — cold-start indoors will likely time out, and that is OK
-    _log(f"  Waiting for GPS fix (up to {_GPS_FIX_TIMEOUT_S:.0f}s) …")
-    deadline = time.monotonic() + _GPS_FIX_TIMEOUT_S
-    while not gps.has_fix and time.monotonic() < deadline:
-        gps.update()
-        time.sleep(0.2)
-
-    if gps.has_fix:
+    if data.has_fix:
         ts = (
-            f"{gps.timestamp_utc.tm_hour:02d}:{gps.timestamp_utc.tm_min:02d}:"
-            f"{gps.timestamp_utc.tm_sec:02d}Z"
-            if gps.timestamp_utc
-            else "n/a"
+            f"{data.timestamp_utc.tm_hour:02d}:{data.timestamp_utc.tm_min:02d}:"
+            f"{data.timestamp_utc.tm_sec:02d}Z"
+            if data.timestamp_utc else "n/a"
         )
-        lat = gps.latitude  if gps.latitude  is not None else 0.0
-        lon = gps.longitude if gps.longitude is not None else 0.0
-        alt = gps.altitude_m if gps.altitude_m is not None else 0.0
         _result(
             "GPS fix",
             True,
-            (
-                f"lat={lat:.6f}  lon={lon:.6f}"
-                f"  alt={alt:.1f}m  sats={gps.satellites}  utc={ts}"
-            ),
+            f"lat={data.latitude:.6f}  lon={data.longitude:.6f}"
+            f"  alt={data.altitude_m:.1f}m  sats={data.satellites}  utc={ts}",
         )
     else:
-        # No fix is not a hardware failure — NMEA activity is the real indicator
-        _result(
-            "GPS fix (no fix yet)",
-            nmea_seen,
-            "module alive, needs clear sky view" if nmea_seen else "GPS module unresponsive",
-        )
+        # No fix indoors/cold-start is normal — NMEA activity proves the module works
+        _result("GPS fix (no fix yet)", True, "module alive, needs clear sky view")
 
-    return gps, gps.has_fix
+    return data, data.has_fix
 
 
 # ---------------------------------------------------------------------------
@@ -847,7 +782,7 @@ def _write_report(rtc) -> None:
     else:
         stamped_sd = None
 
-    # Always write diag_latest.txt — easy to find regardless of RTC state.
+    # Always write diag_latest.txt on /sd — easy to find regardless of RTC state.
     # Also write the timestamped copy when the RTC provided a valid datetime.
     all_targets = ["/sd/diag_latest.txt"]
     if stamped_sd is not None:
@@ -873,18 +808,11 @@ def _write_report(rtc) -> None:
 
 _log("FeatherWeather Diagnostic Mode")
 _log(f"Started  monotonic={time.monotonic():.1f}s")
-_log("Checking: BMP390, HM3301, SHTC3, PCF8523 RTC, SH1107 OLED, GPS, SD card")
+_log("Checking: BMP390, HM3301, SHTC3, PCF8523 RTC, SH1107 OLED, SPH0645 mic, GPS, SD card")
 
-# Release any displayio displays left active by the previous code.py run.
-# A normal code.py boot initialises the SH1107 OLED, which claims board.SCL/SDA
-# via i2cdisplaybus.  On soft-reboot into diagnostic.py those pins remain held
-# until release_displays() is called, otherwise busio.I2C() below raises
-# "ValueError: SCL in use".
-try:
-    import displayio  # noqa: PLC0415
-    displayio.release_displays()
-except Exception:  # noqa: BLE001
-    pass
+# Release any display left active by the previous code.py run before
+# claiming the I2C bus — the previous run's I2CDisplayBus holds SCL/SDA.
+displayio.release_displays()
 
 # I2C bus at 20 kHz — required for HM3301; all other I2C devices tolerate this
 i2c = busio.I2C(board.SCL, board.SDA, frequency=_I2C_FREQ_HZ)
@@ -919,6 +847,10 @@ _track(th_data is not None)
 aq_data = _check_hm3301(i2c)
 _track(aq_data is not None)
 
+# Microphone is on I2S bus (D27/D13/A2), independent of I2C
+mic_data = _check_mic()
+# Not tracked — skipped until audio_i2sin firmware support lands
+
 # GPS is on UART, not I2C
 gps, gps_has_fix = _check_gps()
 gps_alive = gps is not None
@@ -943,6 +875,8 @@ _result("SH1107 OLED",         oled_display is not None)
 _result("BMP390 Barometric",   baro_data is not None)
 _result("SHTC3 Temp/Humidity", th_data is not None)
 _result("HM3301 Air Quality",  aq_data is not None)
+
+_log("[SKIP] SPH0645 Microphone — awaiting audio_i2sin (PR #10990)")
 
 if gps_has_fix:
     _result("GPS", True, "fix acquired")
@@ -980,8 +914,6 @@ _update_oled_summary(_pass_count, _fail_count)
 
 if sd_ok:
     _write_report(rtc)
-    # SD card stays mounted so files are visible via the web workflow browser
-    # at http://<device-ip>/fs/sd/ until the next reset.
 else:
     _log("SD card unavailable — report not saved to disk")
 

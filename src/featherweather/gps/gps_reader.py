@@ -56,6 +56,49 @@ class GpsReader:
     In code.py this is done by the main loop's GPS poll step.
     """
 
+    @classmethod
+    def verify(
+        cls,
+        uart,
+        nmea_timeout_s: float = 5.0,
+        fix_timeout_s: float = 30.0,
+    ) -> "GpsData":
+        """Verify the GPS module is alive and attempt a fix.
+
+        Args:
+            uart:           busio.UART connected to the GPS FeatherWing
+            nmea_timeout_s: seconds to wait for the first parsed NMEA sentence
+            fix_timeout_s:  seconds to attempt a fix after NMEA is confirmed
+
+        Returns:
+            GpsData snapshot.  has_fix reflects whether a fix was acquired.
+
+        Raises:
+            RuntimeError if no NMEA sentences are received within nmea_timeout_s
+            (indicates a wiring or baud-rate problem).
+        """
+        reader = cls(uart)
+
+        deadline = time.monotonic() + nmea_timeout_s
+        nmea_seen = False
+        while time.monotonic() < deadline:
+            if reader._gps.update():
+                nmea_seen = True
+                break
+            time.sleep(0.1)
+
+        if not nmea_seen:
+            raise RuntimeError(
+                f"no NMEA sentences in {nmea_timeout_s:.0f}s — check wiring/baud rate"
+            )
+
+        deadline = time.monotonic() + fix_timeout_s
+        while not reader._gps.has_fix and time.monotonic() < deadline:
+            reader._gps.update()
+            time.sleep(0.2)
+
+        return reader.read()
+
     def __init__(self, uart, debug: bool = False) -> None:
         """
         Args:

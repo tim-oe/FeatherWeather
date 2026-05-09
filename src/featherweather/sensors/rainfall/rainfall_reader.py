@@ -54,6 +54,14 @@ class RainfallReader:
         0x28  2 bytes  base offset          write raw = mm * 10000
     """
 
+    @classmethod
+    def verify(cls, i2c) -> "RainfallData":
+        """Instantiate, take one reading, and return the data.
+
+        Raises on any hardware or communication failure (including VID/PID mismatch).
+        """
+        return cls(i2c).read()
+
     def __init__(self, i2c, address: int = _I2C_ADDR) -> None:
         """
         Args:
