@@ -41,6 +41,7 @@ format = "scripts.lint:format_code"
 test = "scripts.test:main"
 circup-install = "scripts.circup_install:main"
 deploy = "scripts.deploy:main"
+fetch-sd = "scripts.fetch_sd:main"
 
 [tool.poetry]
 packages = [

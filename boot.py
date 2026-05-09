@@ -1,24 +1,46 @@
 """boot.py — runs once before code.py on every boot.
 
-Seeds CircuitPython's internal system clock from the PCF8523 RTC so that
-FAT file timestamps are correct from the first write.
+Two responsibilities:
 
-SD card mounting has intentionally been moved to code.py / diagnostic.py.
-boot.py and code.py run in separate, consecutive Python VMs; any
-storage.mount() call here is torn down before code.py starts, so the SD
-card must be mounted by user code itself.
+1. Mount the Adalogger SD card at /sd for data storage.
+
+2. Seed CircuitPython's internal system clock from the PCF8523 RTC so that
+   FAT file timestamps are correct from the first write.
+
+Pin assignments (ESP32 Feather V2):
+    SPI  SCK / MOSI / MISO   board.SCK / board.MOSI / board.MISO
+    SPI  CS                  board.D33  (Feather "D10" slot → GPIO33)
+    I2C  SCL / SDA            board.SCL / board.SDA
 """
 
 import board
 import busio
+import digitalio
+import storage
+import adafruit_sdcard
 import rtc as _cp_rtc
 import adafruit_pcf8523.pcf8523 as _pcf8523
+
+_SD_CS_PIN = board.D33
+
+
+def _mount_sd() -> None:
+    """Mount the SD card at /sd."""
+    try:
+        spi    = busio.SPI(board.SCK, board.MOSI, board.MISO)
+        cs     = digitalio.DigitalInOut(_SD_CS_PIN)
+        sdcard = adafruit_sdcard.SDCard(spi, cs)
+        vfs    = storage.VfsFat(sdcard)
+        storage.mount(vfs, "/sd")
+        print("boot: SD card mounted at /sd")
+    except Exception as exc:  # noqa: BLE001
+        print(f"boot: SD card mount failed: {exc}")
 
 
 def _sync_system_clock() -> None:
     """Read PCF8523 and set CircuitPython's internal clock so FAT timestamps are correct."""
     try:
-        i2c = busio.I2C(board.SCL, board.SDA)
+        i2c    = busio.I2C(board.SCL, board.SDA)
         hw_rtc = _pcf8523.PCF8523(i2c)
         _cp_rtc.RTC().datetime = hw_rtc.datetime
         dt = hw_rtc.datetime
@@ -31,4 +53,5 @@ def _sync_system_clock() -> None:
         print(f"boot: system clock sync failed: {exc}")
 
 
+_mount_sd()
 _sync_system_clock()

@@ -13,12 +13,12 @@ Usage (CircuitPython):
     uart = busio.UART(board.TX, board.RX, baudrate=9600, timeout=0.1)
     reader = GpsReader(uart)
 
-    # In an async main loop:
-    fixed = await reader.wait_for_fix(timeout_s=120)
+    # Block until fix (or timeout) during startup:
+    fixed = reader.wait_for_fix(timeout_s=120)
     if fixed:
         data = reader.read()
 
-    # Or in a polling background task:
+    # In the main polling loop:
     reader.update()          # process incoming NMEA bytes
     data = reader.read()     # snapshot current state
 
@@ -27,7 +27,6 @@ Reference:
     https://cdn.sparkfun.com/assets/parts/1/2/2/8/0/PMTK_Packet_User_Manual.pdf
 """
 
-import asyncio
 import time
 
 import adafruit_gps
@@ -54,7 +53,7 @@ class GpsReader:
 
     The caller is responsible for polling update() regularly (e.g. every
     200 ms) so the UART receive buffer does not overflow between reads.
-    In code.py this is done by the gps_task background coroutine.
+    In code.py this is done by the main loop's GPS poll step.
     """
 
     def __init__(self, uart, debug: bool = False) -> None:
@@ -105,12 +104,11 @@ class GpsReader:
 
         return data
 
-    async def wait_for_fix(self, timeout_s: float = 120.0) -> bool:
+    def wait_for_fix(self, timeout_s: float = 120.0) -> bool:
         """Poll until a GPS fix is acquired or the timeout expires.
 
-        Intended for use during startup before the main sensor loop begins.
-        Yields control to the asyncio event loop between polls so other
-        tasks can run.
+        Blocks during startup before the main sensor loop begins, polling
+        the UART at _WAIT_POLL_INTERVAL_S intervals.
 
         Args:
             timeout_s: maximum seconds to wait (default 120 s — cold-start
@@ -123,5 +121,5 @@ class GpsReader:
         deadline = time.monotonic() + timeout_s
         while not self._gps.has_fix and time.monotonic() < deadline:
             self._gps.update()
-            await asyncio.sleep(_WAIT_POLL_INTERVAL_S)
+            time.sleep(_WAIT_POLL_INTERVAL_S)
         return self._gps.has_fix

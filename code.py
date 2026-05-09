@@ -6,16 +6,12 @@ The featherweather package must be copied to CIRCUITPY/lib/featherweather/.
 Scheduling strategy:
     Sensor reads happen at fixed N-minute boundaries (cron-style) aligned to
     wall-clock time from the PCF8523 RTC (e.g. :00, :05, :10 ... :55).
-    Between readings the main task sleeps via asyncio.sleep(), allowing the
-    GPS polling task and the button polling task to run cooperatively.
+    Between reads the main loop polls the GPS UART and the OLED buttons at
+    20 Hz using time.monotonic() timestamps — no asyncio required.
 
-Parallelism note:
-    CircuitPython asyncio is cooperative, not preemptive. Blocking I2C / UART
-    calls will not overlap. I2C sensor reads finish in ~5-20 ms each, and
-    RS485 Modbus round-trips take ~50-200 ms each. Total read cycle is well
-    under one second, so sequential reads at a 5-minute interval is fine.
-    asyncio.gather() is used for structural clarity and future async drivers.
-    RS485 sensors MUST remain sequential — they share one UART bus.
+    Initialisation order matters: DisplayController() must be created first so
+    that displayio.release_displays() frees SCL/SDA before the shared I2C bus
+    is obtained via board.STEMMA_I2C().
 
 Pin assignments (adjust to match your wiring):
     I2C  SCL / SDA        board.SCL / board.SDA   (STEMMA QT / FeatherWing)
@@ -23,10 +19,11 @@ Pin assignments (adjust to match your wiring):
     SPI  CS               board.D33               (SD chip-select; mounted at /sd)
     UART1 TX / RX         board.TX / board.RX     (GPS FeatherWing, 9600 baud)
     UART2 TX / RX         board.A0 / board.A1     (RS485 MAX3485, 9600 baud)
-    DE   MAX3485 DE/~RE   board.D11               (RS485 direction control)
-    OLED Button A         board.D9                (previous page)
-    OLED Button B         board.D6                (next page)
-    OLED Button C         board.D5                (force redraw)
+    DE   MAX3485 DE/~RE   board.D12  (GPIO12 — strapping pin, must be LOW at boot;
+                          DE defaults LOW = receive mode, so this is safe)
+    OLED TOP    (C)       board.A6                (GPIO37, input-only — next page)
+    OLED MIDDLE (B)       board.A7                (GPIO32 — toggle display on/off)
+    OLED BOTTOM (A)       board.A8                (GPIO15 — previous page)
 
 Modbus addresses (reprogram conflicting sensors before first use):
     SEN0482 Wind Direction  0x02  (default; run set_address() if conflict)
@@ -34,15 +31,14 @@ Modbus addresses (reprogram conflicting sensors before first use):
     SEN0644 Illuminance     0x01  (default)
 """
 
-import asyncio
 import os
+import time
 
 import adafruit_pcf8523.pcf8523 as _pcf8523_mod
 import adafruit_sdcard
 import board
 import busio
 import digitalio
-import displayio
 import storage
 
 from featherweather.display.display_controller import DisplayController
@@ -63,13 +59,13 @@ from featherweather.sensors.wind_speed.wind_speed_reader import WindSpeedReader
 READ_INTERVAL_MINUTES: int = int(os.getenv("READ_INTERVAL_MINUTES") or 5)
 _NTP_TZ_OFFSET: int = int(os.getenv("NTP_TIMEZONE_OFFSET") or 0)
 
-_GPS_UPDATE_INTERVAL_S: float = 0.2   # poll GPS UART at 5 Hz
 _GPS_BAUD: int = int(os.getenv("GPS_BAUD") or 9600)
+_GPS_POLL_INTERVAL_S: float = 0.2   # poll GPS UART at 5 Hz
 
 _RS485_BAUD: int = int(os.getenv("RS485_BAUD") or 9600)
 _RS485_TIMEOUT_S: float = int(os.getenv("RS485_TIMEOUT_MS") or 500) / 1000
 
-_BUTTON_POLL_INTERVAL_S: float = 0.05  # poll buttons at 20 Hz
+_LOOP_INTERVAL_S: float = 0.05  # main loop cadence — buttons polled at ~20 Hz
 
 # Modbus slave addresses — change if you have reassigned them
 _WIND_DIR_ADDR: int = 0x02
@@ -77,10 +73,30 @@ _WIND_SPD_ADDR: int = 0x03  # reprogrammed from default 0x02 to avoid conflict
 _ILLUMINANCE_ADDR: int = 0x01
 
 # ---------------------------------------------------------------------------
-# Shared GPS state — written by gps_task, read by sensor_cycle_task
+# Shared GPS altitude (updated each GPS poll, consumed by sensor cycle)
 # ---------------------------------------------------------------------------
 
 _gps_altitude_m: float | None = None
+
+
+# ---------------------------------------------------------------------------
+# Fault-tolerant sensor initialisation helper
+# ---------------------------------------------------------------------------
+
+
+def _try_init(label: str, factory):
+    """Call factory(); return the result, or None if it raises.
+
+    Logs a warning so missing hardware is visible in the serial console
+    without aborting the rest of startup.
+    """
+    try:
+        obj = factory()
+        print(f"[init] {label} OK")
+        return obj
+    except Exception as exc:  # noqa: BLE001
+        print(f"[init] {label} SKIPPED ({type(exc).__name__}: {exc})")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -105,180 +121,141 @@ def _seconds_until_next_interval(rtc: _pcf8523_mod.PCF8523) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Individual sensor coroutines
+# GPS poll helper
 # ---------------------------------------------------------------------------
 
 
-async def _read_barometric(reader: BarometricReader, display: DisplayController) -> None:
-    data = reader.read()
-    if _gps_altitude_m is not None:
-        data.sea_level_pressure = BarometricReader.sea_level_pressure_from_altitude(
-            data.pressure, _gps_altitude_m
-        )
-    print(data)
-    display.state.pressure_hpa = data.pressure
-    display.state.baro_temp_c = data.temperature
-    display.state.sea_level_pressure_hpa = data.sea_level_pressure
-    await asyncio.sleep(0)
-
-
-async def _read_temp_humidity(reader: TempHumidityReader, display: DisplayController) -> None:
-    data = reader.read()
-    print(data)
-    display.state.temp_c = data.temperature
-    display.state.humidity_pct = data.relative_humidity
-    await asyncio.sleep(0)
-
-
-async def _read_air_quality(reader: AirQualityReader, display: DisplayController) -> None:
-    data = reader.read()
-    print(data)
-    display.state.pm_1_0 = data.pm_1_0_atm
-    display.state.pm_2_5 = data.pm_2_5_atm
-    display.state.pm_10 = data.pm_10_atm
-    await asyncio.sleep(0)
-
-
-async def _read_rainfall(reader: RainfallReader, display: DisplayController) -> None:
-    data = reader.read()
-    data.rainfall_window_mm = reader.read_window(hours=1)
-    print(data)
-    display.state.rain_cumulative_mm = data.cumulative_rainfall_mm
-    display.state.rain_window_mm = data.rainfall_window_mm
-    await asyncio.sleep(0)
-
-
-async def _read_wind_direction(reader: WindDirectionReader, display: DisplayController) -> None:
-    data = reader.read()
-    print(data)
-    display.state.wind_dir_deg = data.degrees
-    display.state.wind_dir_label = data.direction_label
-    await asyncio.sleep(0)
-
-
-async def _read_wind_speed(reader: WindSpeedReader, display: DisplayController) -> None:
-    data = reader.read()
-    print(data)
-    display.state.wind_speed_ms = data.speed_ms
-    display.state.wind_beaufort = data.beaufort
-    await asyncio.sleep(0)
-
-
-async def _read_illuminance(reader: IlluminanceReader, display: DisplayController) -> None:
-    data = reader.read()
-    print(data)
-    display.state.lux = data.lux
-    await asyncio.sleep(0)
-
-
-# ---------------------------------------------------------------------------
-# GPS background task
-# ---------------------------------------------------------------------------
-
-
-async def gps_task(gps: GpsReader, display: DisplayController) -> None:
-    """Poll the GPS UART continuously, updating shared altitude and display state.
-
-    Runs forever alongside the sensor cycle and button tasks.
-    """
+def _poll_gps(gps: GpsReader, display: DisplayController) -> None:
+    """Process one round of GPS UART bytes and push state to the display."""
     global _gps_altitude_m  # noqa: PLW0603
-    while True:
-        gps.update()
-        data = gps.read()
-        if data.has_fix and data.altitude_m is not None:
-            _gps_altitude_m = data.altitude_m
-
-        display.state.gps_has_fix = data.has_fix
-        display.state.gps_satellites = data.satellites
-        display.state.gps_altitude_m = data.altitude_m
-        if data.timestamp_utc is not None:
-            display.state.gps_utc_h = data.timestamp_utc.tm_hour
-            display.state.gps_utc_m = data.timestamp_utc.tm_min
-            display.state.gps_utc_s = data.timestamp_utc.tm_sec
-
-        await asyncio.sleep(_GPS_UPDATE_INTERVAL_S)
+    gps.update()
+    data = gps.read()
+    if data.has_fix and data.altitude_m is not None:
+        _gps_altitude_m = data.altitude_m
+    display.state.gps_has_fix = data.has_fix
+    display.state.gps_satellites = data.satellites
+    display.state.gps_altitude_m = data.altitude_m
+    if data.timestamp_utc is not None:
+        display.state.gps_utc_h = data.timestamp_utc.tm_hour
+        display.state.gps_utc_m = data.timestamp_utc.tm_min
+        display.state.gps_utc_s = data.timestamp_utc.tm_sec
 
 
 # ---------------------------------------------------------------------------
-# Button polling task
+# Sensor cycle
 # ---------------------------------------------------------------------------
 
 
-async def button_task(display: DisplayController) -> None:
-    """Poll the OLED FeatherWing buttons at 20 Hz and navigate pages."""
-    while True:
-        display.poll_buttons()
-        await asyncio.sleep(_BUTTON_POLL_INTERVAL_S)
-
-
-# ---------------------------------------------------------------------------
-# Sensor cycle task
-# ---------------------------------------------------------------------------
-
-
-async def sensor_cycle_task(
+def _run_sensor_cycle(
     rtc: _pcf8523_mod.PCF8523,
-    baro: BarometricReader,
-    temp_hum: TempHumidityReader,
-    aq: AirQualityReader,
-    rain: RainfallReader,
-    wind_dir: WindDirectionReader,
-    wind_spd: WindSpeedReader,
-    illum: IlluminanceReader,
+    baro,
+    temp_hum,
+    aq,
+    rain,
+    wind_dir,
+    wind_spd,
+    illum,
     display: DisplayController,
 ) -> None:
-    """Sleep until the next interval boundary, read all sensors, then refresh display."""
-    while True:
-        sleep_s = _seconds_until_next_interval(rtc)
-        now = rtc.datetime
-        print(
-            f"[{now.tm_hour:02d}:{now.tm_min:02d}:{now.tm_sec:02d}]"
-            f" next read in {sleep_s:.0f}s"
-        )
-        await asyncio.sleep(sleep_s)
+    """Read all available sensors sequentially and refresh the display.
 
-        now = rtc.datetime
-        print(f"--- reading sensors at {now.tm_hour:02d}:{now.tm_min:02d} ---")
+    Any reader that is None was unavailable at startup and is silently skipped.
+    """
+    now = rtc.datetime
+    print(f"--- reading sensors at {now.tm_hour:02d}:{now.tm_min:02d} ---")
 
-        # I2C sensors: blocking but fast (~5-20 ms each).
-        # gather() provides structure; reads complete sequentially.
-        await asyncio.gather(
-            _read_barometric(baro, display),
-            _read_temp_humidity(temp_hum, display),
-            _read_air_quality(aq, display),
-            _read_rainfall(rain, display),
-        )
+    # I2C sensors
+    if baro is not None:
+        try:
+            data = baro.read()
+            if _gps_altitude_m is not None:
+                data.sea_level_pressure = BarometricReader.sea_level_pressure_from_altitude(
+                    data.pressure, _gps_altitude_m
+                )
+            print(data)
+            display.state.pressure_hpa = data.pressure
+            display.state.baro_temp_c = data.temperature
+            display.state.sea_level_pressure_hpa = data.sea_level_pressure
+        except Exception as exc:  # noqa: BLE001
+            print(f"baro error: {exc}")
 
-        # RS485 sensors: MUST remain sequential — one shared UART bus.
-        await asyncio.gather(
-            _read_wind_direction(wind_dir, display),
-            _read_wind_speed(wind_spd, display),
-            _read_illuminance(illum, display),
-        )
+    if temp_hum is not None:
+        try:
+            data = temp_hum.read()
+            print(data)
+            display.state.temp_c = data.temperature
+            display.state.humidity_pct = data.relative_humidity
+        except Exception as exc:  # noqa: BLE001
+            print(f"temp/hum error: {exc}")
 
-        import time as _time
-        display.state.last_read_s = _time.monotonic()
-        display.render()
+    if aq is not None:
+        try:
+            data = aq.read()
+            print(data)
+            display.state.pm_1_0 = data.pm_1_0_atm
+            display.state.pm_2_5 = data.pm_2_5_atm
+            display.state.pm_10 = data.pm_10_atm
+        except Exception as exc:  # noqa: BLE001
+            print(f"air quality error: {exc}")
 
+    if rain is not None:
+        try:
+            data = rain.read()
+            data.rainfall_window_mm = rain.read_window(hours=1)
+            print(data)
+            display.state.rain_cumulative_mm = data.cumulative_rainfall_mm
+            display.state.rain_window_mm = data.rainfall_window_mm
+        except Exception as exc:  # noqa: BLE001
+            print(f"rainfall error: {exc}")
 
-# ---------------------------------------------------------------------------
-# Hardware initialisation and entry point
-# ---------------------------------------------------------------------------
+    # RS485 sensors — sequential, share one UART bus
+    if wind_dir is not None:
+        try:
+            data = wind_dir.read()
+            print(data)
+            display.state.wind_dir_deg = data.degrees
+            display.state.wind_dir_label = data.direction_label
+        except Exception as exc:  # noqa: BLE001
+            print(f"wind dir error: {exc}")
 
+    if wind_spd is not None:
+        try:
+            data = wind_spd.read()
+            print(data)
+            display.state.wind_speed_ms = data.speed_ms
+            display.state.wind_beaufort = data.beaufort
+        except Exception as exc:  # noqa: BLE001
+            print(f"wind speed error: {exc}")
 
-async def main() -> None:
-    # Release any previously allocated display buses before creating a new one
-    displayio.release_displays()
+    if illum is not None:
+        try:
+            data = illum.read()
+            print(data)
+            display.state.lux = data.lux
+        except Exception as exc:  # noqa: BLE001
+            print(f"illuminance error: {exc}")
 
-    # Shared I2C bus (STEMMA QT / FeatherWing headers)
-    i2c = busio.I2C(board.SCL, board.SDA)
-
-    # OLED FeatherWing #4650 (SH1107 128x64, I2C 0x3C)
-    display = DisplayController(i2c)
+    display.state.last_read_s = time.monotonic()
     display.render()
 
-    # SD card — mount early so /sd is visible in the web file viewer throughout
-    # normal operation and available for future data logging.
+
+# ---------------------------------------------------------------------------
+# Hardware initialisation and main loop
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    # OLED — must be first: DisplayController calls displayio.release_displays()
+    # internally before claiming the I2C bus, which frees SCL/SDA from any
+    # display left active by the previous code.py run.
+    display = DisplayController()
+    display.render()
+
+    # Shared I2C bus — board.STEMMA_I2C() returns the same singleton that
+    # DisplayController already initialised, so no pin conflict occurs.
+    i2c = board.STEMMA_I2C()
+
+    # SD card — mounted in boot.py; re-mount here in case boot.py mount was torn down
     try:
         spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
         cs = digitalio.DigitalInOut(board.D33)
@@ -287,7 +264,7 @@ async def main() -> None:
         storage.mount(vfs, "/sd")
         print("SD card mounted at /sd")
     except Exception as exc:  # noqa: BLE001
-        print(f"SD card mount failed: {exc}")
+        print(f"SD card mount failed (may already be mounted): {exc}")
 
     # RTC — PCF8523 on Adalogger FeatherWing; sync time from NTP on every boot
     rtc = _pcf8523_mod.PCF8523(i2c)
@@ -297,35 +274,82 @@ async def main() -> None:
     gps_uart = busio.UART(board.TX, board.RX, baudrate=_GPS_BAUD, timeout=0.1)
     gps = GpsReader(gps_uart)
     print("Waiting for GPS fix …")
-    fixed = await gps.wait_for_fix(timeout_s=120)
+    fixed = gps.wait_for_fix(timeout_s=120)
     if fixed:
         print(f"GPS fix acquired: {gps.read()}")
     else:
         print("GPS fix timeout — continuing without fix")
 
-    # RS485 MAX3485 — UART2 + direction-control pin
-    rs485_uart = busio.UART(board.A0, board.A1, baudrate=_RS485_BAUD, timeout=_RS485_TIMEOUT_S)
-    de_pin = digitalio.DigitalInOut(board.D11)
-    de_pin.direction = digitalio.Direction.OUTPUT
+    # RS485 MAX3485 — UART2 + direction-control pin (optional: skip if pins unavailable)
+    rs485_uart = None
+    de_pin = None
+    try:
+        rs485_uart = busio.UART(board.A0, board.A1, baudrate=_RS485_BAUD, timeout=_RS485_TIMEOUT_S)
+        de_pin = digitalio.DigitalInOut(board.D12)
+        de_pin.direction = digitalio.Direction.OUTPUT
+        print("[init] RS485 UART OK")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[init] RS485 UART SKIPPED ({type(exc).__name__}: {exc})")
 
-    # Sensor readers
-    baro = BarometricReader(i2c)
-    temp_hum = TempHumidityReader(i2c)
-    aq = AirQualityReader(i2c)
-    rain = RainfallReader(i2c)
-    wind_dir = WindDirectionReader(rs485_uart, de_pin, address=_WIND_DIR_ADDR)
-    wind_spd = WindSpeedReader(rs485_uart, de_pin, address=_WIND_SPD_ADDR)
-    illum = IlluminanceReader(rs485_uart, de_pin, address=_ILLUMINANCE_ADDR)
+    # I2C sensor readers — each is None if the hardware is absent
+    baro     = _try_init("BMP390  (barometric)",    lambda: BarometricReader(i2c))
+    temp_hum = _try_init("SHTC3   (temp/humidity)", lambda: TempHumidityReader(i2c))
+    aq       = _try_init("HM3301  (air quality)",   lambda: AirQualityReader(i2c))
+    rain     = _try_init("SEN0575 (rainfall)",      lambda: RainfallReader(i2c))
+
+    # RS485 sensor readers — each is None if the UART setup failed or sensor absent
+    if rs485_uart is not None and de_pin is not None:
+        wind_dir = _try_init(
+            "SEN0482 (wind direction)",
+            lambda: WindDirectionReader(rs485_uart, de_pin, address=_WIND_DIR_ADDR),
+        )
+        wind_spd = _try_init(
+            "SEN0483 (wind speed)",
+            lambda: WindSpeedReader(rs485_uart, de_pin, address=_WIND_SPD_ADDR),
+        )
+        illum = _try_init(
+            "SEN0644 (illuminance)",
+            lambda: IlluminanceReader(rs485_uart, de_pin, address=_ILLUMINANCE_ADDR),
+        )
+    else:
+        wind_dir = wind_spd = illum = None
 
     print("FeatherWeather ready")
 
-    await asyncio.gather(
-        asyncio.create_task(gps_task(gps, display)),
-        asyncio.create_task(button_task(display)),
-        asyncio.create_task(
-            sensor_cycle_task(rtc, baro, temp_hum, aq, rain, wind_dir, wind_spd, illum, display)
-        ),
+    # Read sensors immediately so the display shows live data from the first button press
+    _run_sensor_cycle(rtc, baro, temp_hum, aq, rain, wind_dir, wind_spd, illum, display)
+
+    # Schedule subsequent reads at fixed interval boundaries
+    next_read_mono = time.monotonic() + _seconds_until_next_interval(rtc)
+    last_gps_poll = 0.0
+    now = rtc.datetime
+    print(
+        f"[{now.tm_hour:02d}:{now.tm_min:02d}:{now.tm_sec:02d}]"
+        f" next read in {next_read_mono - time.monotonic():.0f}s"
     )
 
+    while True:
+        now_mono = time.monotonic()
 
-asyncio.run(main())
+        # GPS — poll at 5 Hz to keep UART buffer clear and state fresh
+        if now_mono - last_gps_poll >= _GPS_POLL_INTERVAL_S:
+            last_gps_poll = now_mono
+            _poll_gps(gps, display)
+
+        # Buttons — polled every loop iteration (~20 Hz)
+        display.poll_buttons()
+
+        # Sensor cycle — fires when the next interval boundary is reached
+        if now_mono >= next_read_mono:
+            _run_sensor_cycle(rtc, baro, temp_hum, aq, rain, wind_dir, wind_spd, illum, display)
+            next_read_mono = time.monotonic() + _seconds_until_next_interval(rtc)
+            now = rtc.datetime
+            print(
+                f"[{now.tm_hour:02d}:{now.tm_min:02d}:{now.tm_sec:02d}]"
+                f" next read in {_seconds_until_next_interval(rtc):.0f}s"
+            )
+
+        time.sleep(_LOOP_INTERVAL_S)
+
+
+main()

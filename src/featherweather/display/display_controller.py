@@ -1,15 +1,21 @@
 """OLED display controller for FeatherWeather.
 
 Drives the Adafruit 128×64 OLED FeatherWing #4650 (SH1107) with a six-page
-scrolling UI. Buttons A / B cycle pages; Button C forces an immediate redraw.
+scrolling UI controlled by three physical buttons on the wing.
 
-Call ``displayio.release_displays()`` **before** constructing this class
-(typically at the very start of ``main()`` in code.py).
+Button layout and function (buttons are stacked vertically on the wing):
 
-Button pin assignments (hardwired on the FeatherWing PCB):
-    Button A  board.D9  → previous page
-    Button B  board.D6  → next page
-    Button C  board.D5  → force redraw
+    Physical position  FeatherWing label  board pin  GPIO   Action
+    ─────────────────  ─────────────────  ─────────  ─────  ──────────────
+    TOP                C                  board.A6   37     next page →
+    MIDDLE             B                  board.A7   32     toggle display on/off
+    BOTTOM             A                  board.A8   15     ← previous page
+                                          (board.A6 is input-only; FeatherWing pulls up)
+
+Note: on the ESP32 Feather V2 the FeatherWing button GPIOs run top-to-bottom
+as A6→A7→A8 (C→B→A), which is the reverse of the alphabetical label order.
+The Feather header pin physically labeled "5" is board.SCK (GPIO5) and is
+permanently owned by the SPI bus (SD card) — not a button pin.
 """
 
 from __future__ import annotations
@@ -105,8 +111,12 @@ def _lbl(text: str, x: int, y: int) -> label.Label:
 
 def _make_button(pin) -> digitalio.DigitalInOut:
     btn = digitalio.DigitalInOut(pin)
-    btn.direction = digitalio.Direction.INPUT
-    btn.pull = digitalio.Pull.UP
+    try:
+        btn.switch_to_input(pull=digitalio.Pull.UP)
+    except (ValueError, AttributeError):
+        # Input-only GPIO (e.g. ESP32 GPIO37) has no internal pull resistor.
+        # The OLED FeatherWing PCB provides external pull-ups on all button lines.
+        btn.switch_to_input(pull=None)
     return btn
 
 
@@ -118,28 +128,39 @@ def _make_button(pin) -> digitalio.DigitalInOut:
 class DisplayController:
     """SH1107 OLED + three-button navigation controller.
 
-    Args:
-        i2c: shared ``busio.I2C`` instance (same bus used by all I2C sensors).
-             ``displayio.release_displays()`` must have been called before
-             this constructor runs.
+    The constructor calls ``displayio.release_displays()`` before claiming the
+    display bus, so the caller does NOT need to do so beforehand.  The I2C bus
+    is obtained from ``board.STEMMA_I2C()`` (CircuitPython's shared singleton),
+    so callers that also need I2C for sensors should use the same call —
+    they will receive the same underlying bus object.
+
+    Button actions:
+        TOP    (C, board.A6) — advance to next page; turns display on if off
+        MIDDLE (B, board.A7) — toggle display on / off
+        BOTTOM (A, board.A8) — go to previous page; turns display on if off
     """
 
-    def __init__(self, i2c) -> None:
-        display_bus = i2cdisplaybus.I2CDisplayBus(i2c, device_address=_OLED_ADDR)
+    def __init__(self) -> None:
+        displayio.release_displays()
+        display_bus = i2cdisplaybus.I2CDisplayBus(board.STEMMA_I2C(), device_address=_OLED_ADDR)
         self._display = SH1107(
             display_bus,
             width=_WIDTH,
             height=_HEIGHT,
             display_offset=DISPLAY_OFFSET_ADAFRUIT_FEATHERWING_OLED_4650,
-            rotation=0,
+            rotation=270,
         )
 
-        self._btn_a = _make_button(board.D9)   # previous page
-        self._btn_b = _make_button(board.D6)   # next page
-        self._btn_c = _make_button(board.D5)   # force redraw
+        # GPIOs run top-to-bottom as A6→A7→A8 (C→B→A) on the ESP32 Feather V2
+        self._btn_c = _make_button(board.A6)   # TOP    button C — next page      (GPIO37, input-only)
+        self._btn_b = _make_button(board.A7)   # MIDDLE button B — toggle display (GPIO32)
+        self._btn_a = _make_button(board.A8)   # BOTTOM button A — previous page  (GPIO15)
 
-        # Per-button debounce timestamps
+        # Per-button state tracking (indexed: 0=C/top, 1=B/mid, 2=A/bottom)
+        # _prev holds the last sampled value; True = released (pull-up idle high)
+        self._prev: list[bool] = [True, True, True]
         self._dbn: list[float] = [0.0, 0.0, 0.0]
+        self._display_on: bool = True
 
         self.state = DisplayState()
         self._page: int = 0
@@ -161,20 +182,38 @@ class DisplayController:
         self._pages[self._page]()
 
     def poll_buttons(self) -> None:
-        """Sample buttons and navigate / redraw on debounced press."""
+        """Sample buttons and act on a single debounced press.
+
+        Triggers on the falling edge only (idle-high → pressed-low transition)
+        so each physical click fires exactly once regardless of hold duration.
+
+        TOP    (C, board.A6) — next page
+        MIDDLE (B, board.A7) — toggle display on / off
+        BOTTOM (A, board.A8) — previous page
+        """
         now = time.monotonic()
-        buttons = (self._btn_a, self._btn_b, self._btn_c)
+        buttons = (self._btn_c, self._btn_b, self._btn_a)  # top → mid → bottom
         for i, btn in enumerate(buttons):
-            if not btn.value and (now - self._dbn[i]) > _DEBOUNCE_S:
-                self._dbn[i] = now
-                if i == 0:
-                    self._page = (self._page - 1) % len(self._pages)
-                    self.render()
-                elif i == 1:
-                    self._page = (self._page + 1) % len(self._pages)
+            val = btn.value
+            pressed = self._prev[i] and not val  # falling edge: was high, now low
+            self._prev[i] = val
+            if not pressed or (now - self._dbn[i]) < _DEBOUNCE_S:
+                continue
+            self._dbn[i] = now
+            if i == 0:                          # TOP (C) — next page
+                self._display_on = True
+                self._page = (self._page + 1) % len(self._pages)
+                self.render()
+            elif i == 1:                        # MIDDLE (B) — toggle on/off
+                self._display_on = not self._display_on
+                if self._display_on:
                     self.render()
                 else:
-                    self.render()
+                    self._display.root_group = displayio.Group()
+            else:                               # BOTTOM (A) — previous page
+                self._display_on = True
+                self._page = (self._page - 1) % len(self._pages)
+                self.render()
 
     # ------------------------------------------------------------------
     # Pages

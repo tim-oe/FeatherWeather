@@ -46,8 +46,7 @@ import busio
 
 _SD_CS_PIN = board.D33
 
-# Set by _verify_sd() so _check_disk() can call sdcard.count() for true capacity.
-_sdcard = None
+_sd_available: bool = False  # set True by _verify_sd() when /sd is accessible
 # Set by _check_oled() so _update_oled_summary() can refresh the screen at the end.
 _oled_display = None
 _GPS_BAUD: int = 9600
@@ -55,6 +54,8 @@ _GPS_NMEA_CHECK_S: float = 5.0    # seconds to wait for the first NMEA sentence
 _GPS_FIX_TIMEOUT_S: float = 30.0  # seconds to attempt a GPS fix
 _I2C_FREQ_HZ: int = 20_000        # HM3301 maximum; all other I2C devices tolerate it
 _NTP_TZ_OFFSET: int = int(__import__("os").getenv("NTP_TIMEZONE_OFFSET") or 0)
+_SHUTDOWN_LINGER_S: float = 3.0   # seconds to keep OLED summary on screen before powering down
+_DEBOUNCE_S: float = 0.08         # button debounce window in seconds
 
 _KNOWN_I2C_ADDRS: dict = {
     0x1D: "SEN0575 (Rainfall)",
@@ -138,36 +139,68 @@ def _result(label: str, ok: bool, detail: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
-# SD card — verify the mount that boot.py established
+# SD card — mount and verify
 # ---------------------------------------------------------------------------
 
 
 def _verify_sd() -> bool:
     """Mount the SD card and confirm it is writable.
 
-    boot.py no longer mounts the SD card (the mount is torn down between the
-    boot.py and code.py VMs).  We mount it here so the card stays available
-    for the rest of this script, and we keep a reference to the SDCard object
-    so _check_disk() can call sdcard.count() for the true physical capacity.
+    boot.py and this VM are separate Python heaps, so both must mount the SD
+    independently.  However, boot.py's C-level VFS registration can persist
+    into this VM depending on the CircuitPython version — in that case
+    storage.mount() raises OSError(EBUSY).  We handle both scenarios:
+
+    * Mount succeeds  → this VM owns the VfsFat; proceed normally.
+    * EBUSY           → boot.py's C-level mount is still live; /sd is
+                        accessible without a new mount.  Verify it is the
+                        real SD card (not CIRCUITPY's plain sd/ subdirectory)
+                        by checking the total capacity via statvfs.  CIRCUITPY
+                        flash is ~3.9 MB; the real SD card is orders of
+                        magnitude larger.
     """
-    global _sdcard  # noqa: PLW0603
+    global _sd_available  # noqa: PLW0603
     _section("Adalogger SD Card")
     try:
-        import os            # noqa: PLC0415
-        import storage       # noqa: PLC0415
-        import digitalio     # noqa: PLC0415
-        import adafruit_sdcard as _asc  # noqa: PLC0415
+        import os                           # noqa: PLC0415
+        import storage                      # noqa: PLC0415
+        import digitalio                    # noqa: PLC0415
+        import adafruit_sdcard as _asc      # noqa: PLC0415
 
         spi    = busio.SPI(board.SCK, board.MOSI, board.MISO)
         cs     = digitalio.DigitalInOut(_SD_CS_PIN)
         sdcard = _asc.SDCard(spi, cs)
         vfs    = storage.VfsFat(sdcard)
-        storage.mount(vfs, "/sd")
-        _sdcard = sdcard  # keep alive for count() in _check_disk()
 
-        _result("SD card mount", True, "mounted at /sd")
+        already_mounted = False
+        try:
+            storage.mount(vfs, "/sd")
+        except OSError as mount_exc:
+            if mount_exc.errno == 16:  # EBUSY — boot.py's C-level mount persists
+                already_mounted = True
+            else:
+                raise
 
-        # Confirm card is writable
+        # Confirm /sd is the real SD card, not CIRCUITPY's plain sd/ folder.
+        # CIRCUITPY flash is ~3.9 MB; any real SD card is at least tens of MB.
+        try:
+            st = os.statvfs("/sd")
+            total_bytes = st[1] * st[2]
+        except Exception:  # noqa: BLE001
+            total_bytes = 0
+
+        if total_bytes < 10 * 1024 * 1024:  # < 10 MB → CIRCUITPY directory, not SD
+            _result(
+                "SD card mount",
+                False,
+                f"/sd is CIRCUITPY flash ({total_bytes // 1024} KB) — "
+                "real SD card not mounted.  Check boot.py and wiring.",
+            )
+            return False
+
+        src = "boot.py C-level mount (EBUSY)" if already_mounted else "mounted at /sd"
+        _result("SD card mount", True, src)
+
         with open("/sd/mounted.txt", "w") as f:
             f.write("SD card mounted OK\n")
             f.flush()
@@ -175,6 +208,7 @@ def _verify_sd() -> bool:
 
         entries = os.listdir("/sd")
         _log(f"    /sd contents: {entries}")
+        _sd_available = True
         return True
     except Exception as exc:  # noqa: BLE001
         _result("SD card", False, str(exc))
@@ -193,16 +227,8 @@ def _check_disk() -> None:
     and reports the CIRCUITPY FAT partition (~3.9 MB of the 8 MB SPI flash; the
     remainder is consumed by the CircuitPython firmware partition).
 
-    SD card (/sd): total capacity comes from sdcard.count() * 512, a direct
-    block-device read that bypasses the VFS layer entirely and returns the true
-    physical size.  Used bytes are computed by walking the tree with os.listdir
-    + os.stat; free is derived as total - used (approximate — ignores FAT
-    metadata overhead such as the FAT tables and cluster slack).
-
-    The SDCard object is kept alive by _verify_sd() which mounts the card in
-    this code.py VM.  (Mounting in boot.py does not help: boot.py and code.py
-    run in separate, consecutive Python VMs, so any mount made in boot.py is
-    torn down before code.py starts.)
+    SD card (/sd): capacity and free space via os.statvfs("/sd").  Used bytes
+    are computed by walking the tree with os.listdir + os.stat.
     """
     _section("Disk Usage")
     import os  # noqa: PLC0415
@@ -254,12 +280,9 @@ def _check_disk() -> None:
         _log(f"  /  unavailable ({exc})")
 
     # --- SD card (/sd) ---
-    # os.statvfs("/sd") is authoritative here because the mount is owned by
-    # this code.py VM.  sdcard.count()*512 reads the CSD register which
-    # misreports capacity on SDXC (>32 GB) cards in SPI mode and is not used.
     _log("  SD card  /sd")
-    if not _sdcard:
-        _log("    unavailable — SD card was not mounted (see SD card section above)")
+    if not _sd_available:
+        _log("    unavailable — SD card not accessible (see SD card section above)")
         return
 
     sd_total = sd_free = None
@@ -599,7 +622,7 @@ def _check_oled(i2c):
             width=128,
             height=64,
             display_offset=DISPLAY_OFFSET_ADAFRUIT_FEATHERWING_OLED_4650,
-            rotation=0,
+            rotation=270,
         )
 
         group = displayio.Group()
@@ -646,8 +669,96 @@ def _update_oled_summary(passed: int, failed: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# GPS check — synchronous polling, uses adafruit_gps directly to avoid
-# importing GpsReader (which pulls in asyncio for wait_for_fix)
+# Peripheral shutdown — OLED + NeoPixel left on after the run is confusing
+# (looks like the script is still doing something).  Power them down cleanly.
+# ---------------------------------------------------------------------------
+
+
+def _shutdown_neopixel() -> None:
+    """Force the NeoPixel dark and release the GPIO so the data line idles low."""
+    if _pixel is None:
+        return
+    try:
+        _pixel.fill(_OFF)
+        _pixel.deinit()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _done_loop(_i2c) -> None:
+    """Hold the OLED summary on screen, then let any OLED button toggle it.
+
+    After _SHUTDOWN_LINGER_S the display is blanked by assigning an empty
+    displayio.Group (all pixels off on OLED — no sleep property needed).
+    Pressing any of the three OLED FeatherWing buttons toggles between the
+    blank screen and the pass/fail summary.  The loop runs forever until the
+    device is reset — the script must never exit or CircuitPython drops to
+    the REPL.
+
+    Button layout on Adafruit Feather ESP32 V2 (board pins differ from SAMD):
+      TOP    Button C  board.A8  GPIO15
+      MIDDLE Button B  board.A7  GPIO32
+      BOTTOM Button A  board.A6  GPIO37  (input-only; FeatherWing pulls up externally)
+    """
+    if _SHUTDOWN_LINGER_S > 0:
+        time.sleep(_SHUTDOWN_LINGER_S)
+
+    blank_group = None
+    if _oled_display is not None:
+        try:
+            import displayio  # noqa: PLC0415
+            blank_group = displayio.Group()  # empty group → all pixels off on OLED
+            _oled_display.root_group = blank_group
+        except Exception:  # noqa: BLE001
+            blank_group = None
+
+    showing = False
+
+    # Feather ESP32 V2 button pins confirmed by live pin scan.
+    # A6 (GPIO37) is input-only on ESP32 — no internal pull resistor, but the
+    # OLED FeatherWing PCB provides external pull-ups on all button lines.
+    _BTN_DEFS = [
+        ("TOP (C)",    "A8"),   # GPIO15
+        ("MIDDLE (B)", "A7"),   # GPIO32
+        ("BOTTOM (A)", "A6"),   # GPIO37 — input-only, rely on external pull-up
+    ]
+    buttons = []
+    try:
+        import digitalio  # noqa: PLC0415
+        for btn_label, pin_name in _BTN_DEFS:
+            try:
+                dio = digitalio.DigitalInOut(getattr(board, pin_name))
+                try:
+                    dio.switch_to_input(pull=digitalio.Pull.UP)
+                except (ValueError, AttributeError):
+                    dio.switch_to_input(pull=None)  # input-only GPIO
+                buttons.append((btn_label, dio))
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+    last_press = time.monotonic()
+    while True:
+        for lbl, dio in buttons:
+            if not dio.value:
+                now = time.monotonic()
+                if (now - last_press) > _DEBOUNCE_S:
+                    last_press = now
+                    showing = not showing
+                    if blank_group is not None:
+                        try:
+                            if showing:
+                                _update_oled_summary(_pass_count, _fail_count)
+                            else:
+                                _oled_display.root_group = blank_group
+                        except Exception:  # noqa: BLE001
+                            pass
+        time.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# GPS check — uses adafruit_gps directly to keep the diagnostic self-contained
 # ---------------------------------------------------------------------------
 
 # NMEA sentences: GGA (position/altitude) + RMC (speed/heading/time) only
@@ -729,22 +840,20 @@ def _check_gps():
 def _write_report(rtc) -> None:
     if rtc is not None:
         dt = rtc.datetime
-        stamped = (
+        stamped_sd = (
             f"/sd/diag_{dt.tm_year}{dt.tm_mon:02d}{dt.tm_mday:02d}"
             f"_{dt.tm_hour:02d}{dt.tm_min:02d}{dt.tm_sec:02d}.txt"
         )
     else:
-        stamped = "/sd/diag_unknown.txt"
+        stamped_sd = None
 
-    # Always write diag_latest.txt so the file is easy to find, plus the
-    # timestamped copy when the RTC is valid.
-    targets = ["/sd/diag_latest.txt"]
-    if stamped != "/sd/diag_unknown.txt":
-        targets.append(stamped)
-    else:
-        targets = [stamped]
+    # Always write diag_latest.txt — easy to find regardless of RTC state.
+    # Also write the timestamped copy when the RTC provided a valid datetime.
+    all_targets = ["/sd/diag_latest.txt"]
+    if stamped_sd is not None:
+        all_targets.append(stamped_sd)
 
-    for filename in targets:
+    for filename in all_targets:
         try:
             with open(filename, "w") as f:
                 for line in _report_lines:
@@ -872,8 +981,17 @@ _update_oled_summary(_pass_count, _fail_count)
 if sd_ok:
     _write_report(rtc)
     # SD card stays mounted so files are visible via the web workflow browser
-    # at http://<device-ip>/fs/#/sd/ until the next reset.
+    # at http://<device-ip>/fs/sd/ until the next reset.
 else:
     _log("SD card unavailable — report not saved to disk")
 
 _log("Diagnostic complete.")
+
+# NeoPixel is done — release it now so the data line idles low.
+_shutdown_neopixel()
+
+# Hold the OLED summary for _SHUTDOWN_LINGER_S, then blank the panel.
+# Any OLED button (A=A6, B=A7, C=A8 on Feather ESP32 V2) toggles the
+# summary on/off until reset. This loop never returns — exiting would
+# drop CircuitPython to the REPL.
+_done_loop(i2c)
