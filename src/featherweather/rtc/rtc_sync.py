@@ -46,6 +46,8 @@ def get_rtc():
     from featherweather.hardware.i2c_bus import get_i2c  # noqa: PLC0415
 
     return _pcf8523_mod.PCF8523(get_i2c())
+
+
 _WIFI_WAIT_S = 15.0
 _POLL_INTERVAL_S = 0.5
 

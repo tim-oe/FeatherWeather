@@ -37,10 +37,10 @@ class NeoPixelIndicator:
     Class-level color tuples (R, G, B) at the configured brightness level:
     """
 
-    GREEN:  tuple = (0, 50, 0)
-    RED:    tuple = (50, 0, 0)
+    GREEN: tuple = (0, 50, 0)
+    RED: tuple = (50, 0, 0)
     YELLOW: tuple = (50, 50, 0)
-    OFF:    tuple = (0, 0, 0)
+    OFF: tuple = (0, 0, 0)
 
     def __init__(self, brightness: float = _DEFAULT_BRIGHTNESS) -> None:
         """Initialise the NeoPixel.  Silently degrades if hardware is absent.

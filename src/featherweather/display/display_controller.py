@@ -314,11 +314,11 @@ class DisplayController:
 
     def _p_gps_status(self) -> None:
         gps = self.payload.gps
-        fix  = "FIX" if _safe(gps, "has_fix", False) else "no fix"
+        fix = "FIX" if _safe(gps, "has_fix", False) else "no fix"
         sats = _fmt(_safe(gps, "satellites"), "{}")
-        lat  = _fmt(_safe(gps, "latitude"),   "{:.5f}")
-        lon  = _fmt(_safe(gps, "longitude"),  "{:.5f}")
-        alt  = _fmt(_safe(gps, "altitude_m"), "{:.1f} m")
+        lat = _fmt(_safe(gps, "latitude"), "{:.5f}")
+        lon = _fmt(_safe(gps, "longitude"), "{:.5f}")
+        alt = _fmt(_safe(gps, "altitude_m"), "{:.1f} m")
         self._draw(
             "GPS",
             f"Status: {fix}  {sats} sats",
@@ -328,7 +328,7 @@ class DisplayController:
         )
 
     def _p_temp_humidity(self) -> None:
-        th   = self.payload.temp_humidity
+        th = self.payload.temp_humidity
         baro = self.payload.barometric
         self._draw(
             "TEMP & HUMIDITY",
@@ -339,7 +339,7 @@ class DisplayController:
 
     def _p_pressure(self) -> None:
         baro = self.payload.barometric
-        gps  = self.payload.gps
+        gps = self.payload.gps
         self._draw(
             "PRESSURE",
             f"Press: {_fmt(_safe(baro, 'pressure'),           '{:.2f} hPa')}",
@@ -357,8 +357,8 @@ class DisplayController:
         )
 
     def _p_wind(self) -> None:
-        wd  = self.payload.wind_direction
-        ws  = self.payload.wind_speed
+        wd = self.payload.wind_direction
+        ws = self.payload.wind_speed
         deg = _safe(wd, "degrees")
         lbl = _safe(wd, "direction_label")
         dir_str = f"{_fmt(deg, '{:.0f}')} {lbl}" if lbl is not None else "---"
@@ -370,7 +370,7 @@ class DisplayController:
         )
 
     def _p_rain_light(self) -> None:
-        rain  = self.payload.rainfall
+        rain = self.payload.rainfall
         illum = self.payload.illuminance
         self._draw(
             "RAIN & LIGHT",
@@ -380,8 +380,8 @@ class DisplayController:
         )
 
     def _p_sound(self) -> None:
-        mic   = self.payload.microphone
-        db    = _safe(mic, "db_spl")
+        mic = self.payload.microphone
+        db = _safe(mic, "db_spl")
         if db is None:
             qual = "---"
         elif db < 30:

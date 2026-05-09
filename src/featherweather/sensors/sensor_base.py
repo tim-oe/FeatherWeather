@@ -39,6 +39,4 @@ class SensorBase:
                      Implementations may also *read* other fields on the payload
                      (e.g. ``payload.gps.altitude_m`` for sea-level pressure).
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} must implement read(payload)"
-        )
+        raise NotImplementedError(f"{type(self).__name__} must implement read(payload)")

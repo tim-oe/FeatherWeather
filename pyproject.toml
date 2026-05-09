@@ -69,7 +69,7 @@ mpremote = ">=1.24"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -p no:debugging"
 
 [tool.coverage.run]
 source = ["src/featherweather"]
