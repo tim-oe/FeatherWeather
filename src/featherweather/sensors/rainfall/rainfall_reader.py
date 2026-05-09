@@ -7,23 +7,25 @@ Source: https://github.com/DFRobot/DFRobot_RainfallSensor
 
 IMPORTANT: Set the DIP switch on the sensor board to the I2C position before use.
 
+Environment variable:
+    RAIN_ADDR  I2C address override, hex or decimal (default 0x1D)
+
 Usage:
-    import busio, board
-    i2c = busio.I2C(board.SCL, board.SDA)
-    reader = RainfallReader(i2c)
-    data = reader.read()
-    data.rainfall_window_mm = reader.read_window(hours=1)
+    reader = RainfallReader()
+    reader.read(payload)           # populates payload.rainfall (cumulative + 1hr window)
+    # or for diagnostics:
+    data = RainfallReader.verify()
 """
 
 import time
 
 from adafruit_bus_device.i2c_device import I2CDevice
 
+from featherweather.sensors.i2c_sensor_base import I2cSensorBase
 from featherweather.sensors.rainfall.rainfall_data import RainfallData
+from featherweather.storage.weather_payload import WeatherPayload
 
 __all__ = ["RainfallReader"]
-
-_I2C_ADDR: int = 0x1D
 
 _REG_PID: int = 0x00
 _REG_CUMULATIVE_RAINFALL: int = 0x10
@@ -42,7 +44,7 @@ _EXPECTED_PID: int = 0x100C0
 _WRITE_DELAY_S: float = 0.05
 
 
-class RainfallReader:
+class RainfallReader(I2cSensorBase):
     """CircuitPython reader for the SEN0575 tipping bucket rainfall sensor.
 
     I2C register protocol (all values little-endian):
@@ -54,39 +56,48 @@ class RainfallReader:
         0x28  2 bytes  base offset          write raw = mm * 10000
     """
 
-    @classmethod
-    def verify(cls, i2c) -> "RainfallData":
-        """Instantiate, take one reading, and return the data.
+    _I2C_ADDR: int = 0x1D
+    _LABEL: str = "SEN0575 (Rainfall)"
 
-        Raises on any hardware or communication failure (including VID/PID mismatch).
-        """
-        return cls(i2c).read()
+    def __init__(self, address: int | None = None) -> None:
+        import os  # noqa: PLC0415
 
-    def __init__(self, i2c, address: int = _I2C_ADDR) -> None:
-        """
-        Args:
-            i2c:     busio.I2C instance
-            address: I2C address (default 0x1D)
+        if address is None:
+            raw = os.getenv("RAIN_ADDR")
+            if raw:
+                address = int(raw, 0)
+        super().__init__(address)
 
-        Raises:
-            ValueError: if device VID/PID does not match SEN0575
-        """
+    def _init_device(self, i2c, address: int) -> None:
         self._device = I2CDevice(i2c, address)
-        if not self._verify():
+        if not self._verify_device():
             raise ValueError("SEN0575 not found or VID/PID mismatch")
 
-    def read(self) -> RainfallData:
-        """Read cumulative rainfall, tip count, and uptime.
+    def read(self, payload: WeatherPayload) -> None:
+        """Read cumulative rainfall, tip count, uptime, and the 1-hour rolling
+        window, then set payload.rainfall.
 
-        Returns:
-            RainfallData populated with current sensor values.
-            rainfall_window_mm is None; call read_window() separately if needed.
+        Args:
+            payload: in-progress WeatherPayload; payload.rainfall is written.
         """
         data = RainfallData()
         data.cumulative_rainfall_mm = self._read_rainfall(_REG_CUMULATIVE_RAINFALL)
         data.bucket_count = self._read_uint32(_REG_RAW_DATA)
         data.working_time_h = self._read_uint16(_REG_SYS_TIME) / _TIME_MINUTES_PER_HOUR
-        return data
+        data.rainfall_window_mm = self.read_window(hours=1)
+        print(data)
+        payload.rainfall = data
+
+    @classmethod
+    def verify(cls) -> "RainfallData":
+        """Instantiate, take one reading, and return the RainfallData.
+
+        Raises on any hardware or communication failure (including VID/PID mismatch).
+        """
+        sensor = cls()
+        payload = WeatherPayload()
+        sensor.read(payload)
+        return payload.rainfall
 
     def read_window(self, hours: int) -> float:
         """Get cumulative rainfall within a rolling time window.
@@ -95,10 +106,10 @@ class RainfallReader:
             hours: window length in hours (1 - 24)
 
         Returns:
-            Rainfall in mm over the specified window
+            Rainfall in mm over the specified window.
 
         Raises:
-            ValueError: if hours is outside the 1-24 range
+            ValueError: if hours is outside the 1-24 range.
         """
         if not 1 <= hours <= 24:
             raise ValueError(f"hours must be 1-24, got {hours}")
@@ -110,7 +121,7 @@ class RainfallReader:
         raw = int(base_mm * _RAINFALL_SCALE)
         self._write_register(_REG_BASE_RAINFALL, [raw & 0xFF, raw >> 8])
 
-    def _verify(self) -> bool:
+    def _verify_device(self) -> bool:
         buf = self._read_register(_REG_PID, 4)
         pid = buf[0] | (buf[1] << 8) | ((buf[3] & 0xC0) << 10)
         vid = buf[2] | ((buf[3] & 0x3F) << 8)

@@ -3,6 +3,10 @@
 Drives the Adafruit 128×64 OLED FeatherWing #4650 (SH1107) with an eight-page
 scrolling UI controlled by three physical buttons on the wing.
 
+``DisplayController`` holds a ``WeatherPayload`` as its single source of truth.
+All display pages read directly from the payload — adding a new sensor only
+requires adding a page here; no separate state container needs updating.
+
 Button layout and function (buttons are stacked vertically on the wing):
 
     Physical position  FeatherWing label  board pin  GPIO   Action
@@ -12,14 +16,13 @@ Button layout and function (buttons are stacked vertically on the wing):
     BOTTOM             A                  board.A8   15     ← previous page
                                           (board.A6 is input-only; FeatherWing pulls up)
 
-Note: on the ESP32 Feather V2 the FeatherWing button GPIOs run top-to-bottom
-as A6→A7→A8 (C→B→A), which is the reverse of the alphabetical label order.
-The Feather header pin physically labeled "5" is board.SCK (GPIO5) and is
-permanently owned by the SPI bus (SD card) — not a button pin.
+Environment variables:
+    OLED_ADDR   I2C address of the SH1107 display, hex or decimal (default 0x3C)
 """
 
 from __future__ import annotations
 
+import os
 import time
 
 import board
@@ -33,7 +36,10 @@ from adafruit_displayio_sh1107 import (
     SH1107,
 )
 
-__all__ = ["DisplayController", "DisplayState"]
+from featherweather.hardware.i2c_bus import get_i2c
+from featherweather.storage.weather_payload import WeatherPayload
+
+__all__ = ["DisplayController"]
 
 _WIDTH: int = 128
 _HEIGHT: int = 64
@@ -50,56 +56,6 @@ _Y_L3: int = 42
 _Y_L4: int = 54
 
 
-class DisplayState:
-    """Mutable snapshot of all sensor readings shown on the display.
-
-    All fields default to ``None``; the display renders ``---`` for None values.
-    Update these fields after each sensor cycle and call
-    ``DisplayController.render()`` to refresh the screen.
-    """
-
-    def __init__(self) -> None:
-        # Network
-        self.ip_address: str | None = None
-        # GPS / status
-        self.gps_has_fix: bool = False
-        self.gps_satellites: int | None = None
-        self.gps_utc_h: int | None = None
-        self.gps_utc_m: int | None = None
-        self.gps_utc_s: int | None = None
-        self.gps_utc_day: int | None = None
-        self.gps_utc_month: int | None = None
-        self.gps_utc_year: int | None = None
-        self.gps_latitude: float | None = None
-        self.gps_longitude: float | None = None
-        self.gps_altitude_m: float | None = None
-        # Temperature & Humidity (SHTC3)
-        self.temp_c: float | None = None
-        self.humidity_pct: float | None = None
-        # Barometric (BMP390)
-        self.baro_temp_c: float | None = None
-        self.pressure_hpa: float | None = None
-        self.sea_level_pressure_hpa: float | None = None
-        # Air quality (HM3301)
-        self.pm_1_0: int | None = None
-        self.pm_2_5: int | None = None
-        self.pm_10: int | None = None
-        # Wind direction (SEN0482) + speed (SEN0483)
-        self.wind_dir_deg: float | None = None
-        self.wind_dir_label: str | None = None
-        self.wind_speed_ms: float | None = None
-        self.wind_beaufort: str | None = None
-        # Rainfall (SEN0575)
-        self.rain_cumulative_mm: float | None = None
-        self.rain_window_mm: float | None = None
-        # Illuminance (SEN0644)
-        self.lux: float | None = None
-        # Sound level (SPH0645 I2S mic #3421)
-        self.db_spl: float | None = None
-        # Monotonic timestamp of the last completed sensor cycle
-        self.last_read_s: float | None = None
-
-
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
@@ -113,6 +69,11 @@ def _fmt(value, fmt: str, fallback: str = "---") -> str:
         return fmt.format(value)
     except (ValueError, TypeError):
         return fallback
+
+
+def _safe(obj, attr, default=None):
+    """Return ``getattr(obj, attr)`` or *default* when *obj* is None."""
+    return getattr(obj, attr, default) if obj is not None else default
 
 
 def _lbl(text: str, x: int, y: int) -> label.Label:
@@ -138,10 +99,21 @@ def _make_button(pin) -> digitalio.DigitalInOut:
 class DisplayController:
     """SH1107 OLED + three-button navigation controller.
 
-    The constructor calls ``displayio.release_displays()`` before claiming the
-    display bus.  The caller must call ``displayio.release_displays()`` before
-    creating the ``busio.I2C`` instance (to free SCL/SDA from any display left
-    active by the previous code.py run), then pass that bus here.
+    Acquires the shared I2C bus via ``featherweather.hardware.i2c_bus.get_i2c()``
+    and calls ``displayio.release_displays()`` before claiming the display bus.
+
+    Class-level I2C identity — read by ``diagnostic.py`` to populate the bus-scan
+    address map without duplicating the address in multiple places::
+
+        DisplayController.I2C_ADDR  # 0x3C
+        DisplayController.LABEL     # "SH1107 (OLED FeatherWing #4650)"
+
+    Data model:
+        ``self.payload`` is a ``WeatherPayload`` — the single source of truth
+        for all sensor readings shown on screen.  Update it with::
+
+            display.update(new_payload)      # full sensor cycle result
+            display.update_gps(gps_data)     # GPS-only refresh (5 Hz polling)
 
     Button actions:
         TOP    (C, board.A6) — advance to next page; turns display on if off
@@ -149,9 +121,14 @@ class DisplayController:
         BOTTOM (A, board.A8) — go to previous page; turns display on if off
     """
 
-    def __init__(self, i2c) -> None:
+    I2C_ADDR: int = _OLED_ADDR
+    LABEL: str = "SH1107 (OLED FeatherWing #4650)"
+
+    def __init__(self) -> None:
+        _env = os.getenv("OLED_ADDR")
+        addr = int(_env, 0) if _env else _OLED_ADDR
         displayio.release_displays()
-        display_bus = i2cdisplaybus.I2CDisplayBus(i2c, device_address=_OLED_ADDR)
+        display_bus = i2cdisplaybus.I2CDisplayBus(get_i2c(), device_address=addr)
         self._display = SH1107(
             display_bus,
             width=_WIDTH,
@@ -161,24 +138,21 @@ class DisplayController:
         )
 
         # GPIOs run top-to-bottom as A6→A7→A8 (C→B→A) on the ESP32 Feather V2
-        self._btn_c = _make_button(
-            board.A6
-        )  # TOP    button C — next page      (GPIO37, input-only)
-        self._btn_b = _make_button(
-            board.A7
-        )  # MIDDLE button B — toggle display (GPIO32)
-        self._btn_a = _make_button(
-            board.A8
-        )  # BOTTOM button A — previous page  (GPIO15)
+        self._btn_c = _make_button(board.A6)  # TOP    button C — next page (GPIO37)
+        self._btn_b = _make_button(board.A7)  # MIDDLE button B — toggle display
+        self._btn_a = _make_button(board.A8)  # BOTTOM button A — previous page
 
-        # Per-button state tracking (indexed: 0=C/top, 1=B/mid, 2=A/bottom)
-        # _prev holds the last sampled value; True = released (pull-up idle high)
+        # Per-button state (indexed: 0=C/top, 1=B/mid, 2=A/bottom)
         self._prev: list[bool] = [True, True, True]
         self._dbn: list[float] = [0.0, 0.0, 0.0]
         self._display_on: bool = True
         self._last_activity_s: float = time.monotonic()
 
-        self.state = DisplayState()
+        # Single source of truth for all sensor data shown on screen.
+        # Starts as an empty payload (all sensors None) so pages always have
+        # a valid object to read from without None guards on self.payload itself.
+        self.payload: WeatherPayload = WeatherPayload()
+
         self._page: int = 0
         self._pages = [
             self._p_status,
@@ -196,27 +170,85 @@ class DisplayController:
     # ------------------------------------------------------------------
 
     def render(self) -> None:
-        """Redraw the current page. No-ops when the display is toggled off."""
+        """Redraw the current sensor page. No-ops when the display is toggled off."""
         if not self._display_on:
             return
         self._pages[self._page]()
 
+    def update(self, payload: WeatherPayload) -> None:
+        """Replace the current payload with *payload* and refresh the display.
+
+        Called once per sensor cycle.  Because ``WeatherPayload`` is the
+        single data container, no field-by-field mapping is needed — simply
+        pass the freshly-built payload here.
+
+        Args:
+            payload: the completed observation from the latest sensor cycle.
+        """
+        self.payload = payload
+        self.render()
+
+    def update_gps(self, gps_data) -> None:
+        """Update only the GPS slice of the current payload.
+
+        Called at ~5 Hz from the main loop so GPS state stays current between
+        sensor cycles without triggering a full display redraw.
+
+        Args:
+            gps_data: ``GpsData`` instance from ``GpsReader.read()``.
+        """
+        self.payload.gps = gps_data
+
+    def display(
+        self,
+        line1: str = "",
+        line2: str = "",
+        line3: str = "",
+        line4: str = "",
+    ) -> None:
+        """Show up to four lines of text directly on the OLED.
+
+        Bypasses the sensor-page system; useful for status messages,
+        diagnostic splash screens, and summary readouts.
+
+        Line positions:
+            line1 → title row  (y = 4)
+            line2 → row 1      (y = 18)
+            line3 → row 2      (y = 30)
+            line4 → row 3      (y = 42)
+        """
+        group = displayio.Group()
+        for text, y in (
+            (line1, _Y_TITLE),
+            (line2, _Y_L1),
+            (line3, _Y_L2),
+            (line4, _Y_L3),
+        ):
+            if text:
+                group.append(_lbl(text, 0, y))
+        self._display.root_group = group
+        self._display_on = True
+        self._last_activity_s = time.monotonic()
+
+    def blank(self) -> None:
+        """Blank the display (all pixels off) without changing the current page."""
+        self._display_on = False
+        self._display.root_group = displayio.Group()
+
+    def any_button_pressed(self) -> bool:
+        """Return True if any OLED button is currently held down (active low)."""
+        return not self._btn_a.value or not self._btn_b.value or not self._btn_c.value
+
     def poll_buttons(self) -> None:
         """Sample buttons and act on a single debounced press.
 
-        Triggers on the falling edge only (idle-high → pressed-low transition)
-        so each physical click fires exactly once regardless of hold duration.
+        Triggers on the falling edge (idle-high → pressed-low) so each physical
+        click fires exactly once regardless of hold duration.
 
-        TOP    (C, board.A6) — next page
-        MIDDLE (B, board.A7) — toggle display on / off
-        BOTTOM (A, board.A8) — previous page
-
-        Auto-off: the display blanks after _AUTO_OFF_S seconds of inactivity.
-        Any button press wakes it.
+        Auto-off: blanks after ``_AUTO_OFF_S`` seconds of inactivity.
         """
         now = time.monotonic()
 
-        # Auto-off: blank the display after inactivity timeout
         if self._display_on and (now - self._last_activity_s) >= _AUTO_OFF_S:
             self._display_on = False
             self._display.root_group = displayio.Group()
@@ -224,12 +256,12 @@ class DisplayController:
         buttons = (self._btn_c, self._btn_b, self._btn_a)  # top → mid → bottom
         for i, btn in enumerate(buttons):
             val = btn.value
-            pressed = self._prev[i] and not val  # falling edge: was high, now low
+            pressed = self._prev[i] and not val
             self._prev[i] = val
             if not pressed or (now - self._dbn[i]) < _DEBOUNCE_S:
                 continue
             self._dbn[i] = now
-            self._last_activity_s = now  # any press resets the inactivity timer
+            self._last_activity_s = now
             if i == 0:  # TOP (C) — next page
                 self._display_on = True
                 self._page = (self._page + 1) % len(self._pages)
@@ -246,25 +278,30 @@ class DisplayController:
                 self.render()
 
     # ------------------------------------------------------------------
-    # Pages
+    # Pages — all read directly from self.payload
     # ------------------------------------------------------------------
 
     def _p_status(self) -> None:
-        s = self.state
-        ip = s.ip_address if s.ip_address is not None else "---"
+        p = self.payload
+        gps = p.gps
+        ip = p.ip_address or "---"
         date = (
-            f"{s.gps_utc_year:04d}-{s.gps_utc_month:02d}-{s.gps_utc_day:02d}"
-            if s.gps_has_fix and s.gps_utc_year is not None
+            f"{gps.timestamp_utc.tm_year:04d}-"
+            f"{gps.timestamp_utc.tm_mon:02d}-"
+            f"{gps.timestamp_utc.tm_mday:02d}"
+            if gps is not None and gps.has_fix and gps.timestamp_utc is not None
             else "---"
         )
         utc = (
-            f"{s.gps_utc_h:02d}:{s.gps_utc_m:02d}:{s.gps_utc_s:02d} UTC"
-            if s.gps_has_fix and s.gps_utc_h is not None
+            f"{gps.timestamp_utc.tm_hour:02d}:"
+            f"{gps.timestamp_utc.tm_min:02d}:"
+            f"{gps.timestamp_utc.tm_sec:02d} UTC"
+            if gps is not None and gps.has_fix and gps.timestamp_utc is not None
             else "---"
         )
         age = (
-            f"{int(time.monotonic() - s.last_read_s)}s ago"
-            if s.last_read_s is not None
+            f"{int(time.monotonic() - p.last_read_s)}s ago"
+            if p.last_read_s is not None
             else "waiting..."
         )
         self._draw(
@@ -276,12 +313,12 @@ class DisplayController:
         )
 
     def _p_gps_status(self) -> None:
-        s = self.state
-        fix = "FIX" if s.gps_has_fix else "no fix"
-        sats = _fmt(s.gps_satellites, "{}")
-        lat = _fmt(s.gps_latitude, "{:.5f}")
-        lon = _fmt(s.gps_longitude, "{:.5f}")
-        alt = _fmt(s.gps_altitude_m, "{:.1f} m")
+        gps = self.payload.gps
+        fix  = "FIX" if _safe(gps, "has_fix", False) else "no fix"
+        sats = _fmt(_safe(gps, "satellites"), "{}")
+        lat  = _fmt(_safe(gps, "latitude"),   "{:.5f}")
+        lon  = _fmt(_safe(gps, "longitude"),  "{:.5f}")
+        alt  = _fmt(_safe(gps, "altitude_m"), "{:.1f} m")
         self._draw(
             "GPS",
             f"Status: {fix}  {sats} sats",
@@ -291,74 +328,76 @@ class DisplayController:
         )
 
     def _p_temp_humidity(self) -> None:
-        s = self.state
+        th   = self.payload.temp_humidity
+        baro = self.payload.barometric
         self._draw(
             "TEMP & HUMIDITY",
-            f"Temp:  {_fmt(s.temp_c, '{:.1f} C')}",
-            f"Hum:   {_fmt(s.humidity_pct, '{:.1f} %RH')}",
-            f"BMP T: {_fmt(s.baro_temp_c, '{:.1f} C')}",
+            f"Temp:  {_fmt(_safe(th,   'temperature'),     '{:.1f} C')}",
+            f"Hum:   {_fmt(_safe(th,   'relative_humidity'), '{:.1f} %RH')}",
+            f"BMP T: {_fmt(_safe(baro, 'temperature'),     '{:.1f} C')}",
         )
 
     def _p_pressure(self) -> None:
-        s = self.state
+        baro = self.payload.barometric
+        gps  = self.payload.gps
         self._draw(
             "PRESSURE",
-            f"Press: {_fmt(s.pressure_hpa, '{:.2f} hPa')}",
-            f"SLP:   {_fmt(s.sea_level_pressure_hpa, '{:.2f} hPa')}",
-            f"Alt:   {_fmt(s.gps_altitude_m, '{:.1f} m')}",
+            f"Press: {_fmt(_safe(baro, 'pressure'),           '{:.2f} hPa')}",
+            f"SLP:   {_fmt(_safe(baro, 'sea_level_pressure'), '{:.2f} hPa')}",
+            f"Alt:   {_fmt(_safe(gps,  'altitude_m'),         '{:.1f} m')}",
         )
 
     def _p_air_quality(self) -> None:
-        s = self.state
+        aq = self.payload.air_quality
         self._draw(
             "AIR QUALITY",
-            f"PM1.0: {_fmt(s.pm_1_0, '{} ug/m3')}",
-            f"PM2.5: {_fmt(s.pm_2_5, '{} ug/m3')}",
-            f"PM10:  {_fmt(s.pm_10, '{} ug/m3')}",
+            f"PM1.0: {_fmt(_safe(aq, 'pm_1_0_atm'), '{} ug/m3')}",
+            f"PM2.5: {_fmt(_safe(aq, 'pm_2_5_atm'), '{} ug/m3')}",
+            f"PM10:  {_fmt(_safe(aq, 'pm_10_atm'),  '{} ug/m3')}",
         )
 
     def _p_wind(self) -> None:
-        s = self.state
-        dir_str = (
-            f"{_fmt(s.wind_dir_deg, '{:.0f}')} {s.wind_dir_label}"
-            if s.wind_dir_label is not None
-            else "---"
-        )
+        wd  = self.payload.wind_direction
+        ws  = self.payload.wind_speed
+        deg = _safe(wd, "degrees")
+        lbl = _safe(wd, "direction_label")
+        dir_str = f"{_fmt(deg, '{:.0f}')} {lbl}" if lbl is not None else "---"
         self._draw(
             "WIND",
             f"Dir:   {dir_str}",
-            f"Speed: {_fmt(s.wind_speed_ms, '{:.1f} m/s')}",
-            f"       {s.wind_beaufort or '---'}",
+            f"Speed: {_fmt(_safe(ws, 'speed_ms'),  '{:.1f} m/s')}",
+            f"       {_safe(ws, 'beaufort') or '---'}",
         )
 
     def _p_rain_light(self) -> None:
-        s = self.state
+        rain  = self.payload.rainfall
+        illum = self.payload.illuminance
         self._draw(
             "RAIN & LIGHT",
-            f"Total: {_fmt(s.rain_cumulative_mm, '{:.2f} mm')}",
-            f"1hr:   {_fmt(s.rain_window_mm, '{:.2f} mm')}",
-            f"Light: {_fmt(s.lux, '{:.0f} lux')}",
+            f"Total: {_fmt(_safe(rain,  'cumulative_rainfall_mm'), '{:.2f} mm')}",
+            f"1hr:   {_fmt(_safe(rain,  'rainfall_window_mm'),     '{:.2f} mm')}",
+            f"Light: {_fmt(_safe(illum, 'lux'),                    '{:.0f} lux')}",
         )
 
     def _p_sound(self) -> None:
-        s = self.state
-        # Qualitative label based on standard dB SPL ranges
-        if s.db_spl is None:
-            label = "---"
-        elif s.db_spl < 30:
-            label = "Very quiet"
-        elif s.db_spl < 50:
-            label = "Quiet"
-        elif s.db_spl < 70:
-            label = "Moderate"
-        elif s.db_spl < 85:
-            label = "Loud"
+        mic   = self.payload.microphone
+        db    = _safe(mic, "db_spl")
+        if db is None:
+            qual = "---"
+        elif db < 30:
+            qual = "Very quiet"
+        elif db < 50:
+            qual = "Quiet"
+        elif db < 70:
+            qual = "Moderate"
+        elif db < 85:
+            qual = "Loud"
         else:
-            label = "Very loud"
+            qual = "Very loud"
         self._draw(
             "SOUND LEVEL",
-            f"dB SPL: {_fmt(s.db_spl, '{:.1f} dB')}",
-            f"Level:  {label}",
+            f"dB SPL: {_fmt(db, '{:.1f} dB')}",
+            f"Level:  {qual}",
         )
 
     # ------------------------------------------------------------------
@@ -372,13 +411,10 @@ class DisplayController:
         indicator = f"{self._page + 1}/{n}"
 
         group = displayio.Group()
-
-        # Title on the left, page indicator on the right — same y row
         group.append(_lbl(title, 0, _Y_TITLE))
         ind_x = max(0, _WIDTH - len(indicator) * 6)
         group.append(_lbl(indicator, ind_x, _Y_TITLE))
 
-        # Content lines
         y_positions = (_Y_L1, _Y_L2, _Y_L3, _Y_L4)
         for i, line in enumerate(lines[:4]):
             group.append(_lbl(line, 0, y_positions[i]))

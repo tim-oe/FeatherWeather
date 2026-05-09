@@ -16,7 +16,7 @@ Hardware checked
     SH1107       OLED FeatherWing #4650 128×64      I2C 0x3C
     SPH0645      I2S MEMS microphone #3421          I2S (D27/D13/A2)
     Ultimate GPS UART NMEA activity + optional fix  board.TX / board.RX
-    SD card      Adalogger FeatherWing SPI storage  board.D10 CS
+    SD card      Adalogger FeatherWing SPI storage  board.D33 CS
 
 Output
 ------
@@ -29,18 +29,12 @@ Output
 
 import time
 
-import board
-import busio
-import digitalio
-import displayio
-import i2cdisplaybus
-import terminalio
-from adafruit_display_text import label
-from adafruit_displayio_sh1107 import DISPLAY_OFFSET_ADAFRUIT_FEATHERWING_OLED_4650, SH1107
-from adafruit_pcf8523.pcf8523 import PCF8523
-
+from featherweather.display.display_controller import DisplayController
+from featherweather.display.neopixel_indicator import NeoPixelIndicator
 from featherweather.gps.gps_reader import GpsReader
-from featherweather.rtc.rtc_sync import sync_rtc_from_ntp
+from featherweather.hardware.i2c_bus import get_i2c
+from featherweather.hardware.sd_card import verify_sd
+from featherweather.rtc.rtc_sync import PCF8523_I2C_ADDR, PCF8523_LABEL, get_rtc, sync_rtc_from_ntp
 from featherweather.sensors.air_quality.air_quality_reader import AirQualityReader
 from featherweather.sensors.barometric.barometric_reader import BarometricReader
 from featherweather.sensors.microphone.microphone_reader import MicrophoneReader
@@ -48,70 +42,31 @@ from featherweather.sensors.rainfall.rainfall_reader import RainfallReader
 from featherweather.sensors.temp_humidity.temp_humidity_reader import TempHumidityReader
 
 # ---------------------------------------------------------------------------
-# Optional library imports — loaded lazily inside each check function so a
-# missing library causes a [FAIL] for that device rather than crashing the
-# whole script and putting the device in a reboot loop.
-# ---------------------------------------------------------------------------
-
-# These built-in / always-present modules are safe to import at the top level:
-#   time, board, busio, digitalio, storage  (all built into CircuitPython firmware)
-
-# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-_SD_CS_PIN = board.D33
-
-_sd_available: bool = False  # set True by _verify_sd() when /sd is accessible
-# Set by _check_oled() so _update_oled_summary() can refresh the screen at the end.
-_oled_display = None
-_GPS_BAUD: int = 9600
 _GPS_NMEA_CHECK_S: float = 5.0    # seconds to wait for the first NMEA sentence
 _GPS_FIX_TIMEOUT_S: float = 30.0  # seconds to attempt a GPS fix
-_I2C_FREQ_HZ: int = 20_000        # HM3301 maximum; all other I2C devices tolerate it
-_NTP_TZ_OFFSET: int = int(__import__("os").getenv("NTP_TIMEZONE_OFFSET") or 0)
-_SHUTDOWN_LINGER_S: float = 3.0   # seconds to keep OLED summary on screen before powering down
+_SHUTDOWN_LINGER_S: float = 3.0   # seconds to keep OLED summary on screen
 _DEBOUNCE_S: float = 0.08         # button debounce window in seconds
 
+# Built from each class's own _I2C_ADDR / _LABEL — never edit this dict directly.
+# To add a new device: set _I2C_ADDR and _LABEL on its class, then add the class here.
 _KNOWN_I2C_ADDRS: dict = {
-    0x1D: "SEN0575 (Rainfall)",
-    0x3C: "SH1107 (OLED FeatherWing #4650)",
-    0x40: "HM3301 (Air Quality)",
-    0x68: "PCF8523 (Adalogger RTC)",
-    0x70: "SHTC3 (Temp/Humidity)",
-    0x77: "BMP390 (Barometric)",
+    cls._I2C_ADDR: cls._LABEL
+    for cls in (BarometricReader, TempHumidityReader, AirQualityReader, RainfallReader)
 }
+_KNOWN_I2C_ADDRS[DisplayController.I2C_ADDR] = DisplayController.LABEL
+_KNOWN_I2C_ADDRS[PCF8523_I2C_ADDR] = PCF8523_LABEL
 
 # ---------------------------------------------------------------------------
 # NeoPixel — single built-in pixel for visual pass/fail feedback
 # ---------------------------------------------------------------------------
 
-_GREEN  = (0, 50, 0)
-_RED    = (50, 0, 0)
-_YELLOW = (50, 50, 0)
-_OFF    = (0, 0, 0)
-
-_pixel = None
-try:
-    import neopixel  # noqa: PLC0415
-    _pixel = neopixel.NeoPixel(board.NEOPIXEL, 1, brightness=0.2, auto_write=True)
-    _pixel[0] = _OFF
-except Exception:  # noqa: BLE001
-    pass  # NeoPixel unavailable — visual feedback silently skipped
-
-
-def _flash(color, count: int = 1, on_ms: int = 200, off_ms: int = 100) -> None:
-    """Flash the built-in NeoPixel *count* times in *color*."""
-    if _pixel is None:
-        return
-    for _ in range(count):
-        _pixel[0] = color
-        time.sleep(on_ms / 1000)
-        _pixel[0] = _OFF
-        time.sleep(off_ms / 1000)
+_pixel = NeoPixelIndicator()
 
 # ---------------------------------------------------------------------------
-# Result tracking — updated in the main flow after each top-level test
+# Result tracking
 # ---------------------------------------------------------------------------
 
 _pass_count: int = 0
@@ -123,14 +78,13 @@ def _track(ok: bool) -> None:
     global _pass_count, _fail_count
     if ok:
         _pass_count += 1
-        _flash(_GREEN)
+        _pixel.flash_pass()
     else:
         _fail_count += 1
-        _flash(_RED)
-
+        _pixel.flash_fail()
 
 # ---------------------------------------------------------------------------
-# Report buffer — all output is echoed to serial and buffered for SD write
+# Report buffer
 # ---------------------------------------------------------------------------
 
 _report_lines: list = []
@@ -148,10 +102,10 @@ def _section(title: str) -> None:
     _log("=" * 54)
 
 
-def _result(label: str, ok: bool, detail: str = "") -> None:
+def _result(lbl: str, ok: bool, detail: str = "") -> None:
     status = "PASS" if ok else "FAIL"
     suffix = f"  ({detail})" if detail else ""
-    _log(f"  [{status}] {label}{suffix}")
+    _log(f"  [{status}] {lbl}{suffix}")
 
 
 # ---------------------------------------------------------------------------
@@ -159,76 +113,17 @@ def _result(label: str, ok: bool, detail: str = "") -> None:
 # ---------------------------------------------------------------------------
 
 
-def _verify_sd() -> bool:
-    """Mount the SD card and confirm it is writable.
-
-    boot.py and this VM are separate Python heaps, so both must mount the SD
-    independently.  However, boot.py's C-level VFS registration can persist
-    into this VM depending on the CircuitPython version — in that case
-    storage.mount() raises OSError(EBUSY).  We handle both scenarios:
-
-    * Mount succeeds  → this VM owns the VfsFat; proceed normally.
-    * EBUSY           → boot.py's C-level mount is still live; /sd is
-                        accessible without a new mount.  Verify it is the
-                        real SD card (not CIRCUITPY's plain sd/ subdirectory)
-                        by checking the total capacity via statvfs.  CIRCUITPY
-                        flash is ~3.9 MB; the real SD card is orders of
-                        magnitude larger.
-    """
-    global _sd_available  # noqa: PLW0603
+def _check_sd() -> bool:
+    """Mount the SD card and confirm it is real and writable."""
     _section("Adalogger SD Card")
-    try:
-        import os                           # noqa: PLC0415
-        import storage                      # noqa: PLC0415
-        import digitalio                    # noqa: PLC0415
-        import adafruit_sdcard as _asc      # noqa: PLC0415
-
-        spi    = busio.SPI(board.SCK, board.MOSI, board.MISO)
-        cs     = digitalio.DigitalInOut(_SD_CS_PIN)
-        sdcard = _asc.SDCard(spi, cs)
-        vfs    = storage.VfsFat(sdcard)
-
-        already_mounted = False
-        try:
-            storage.mount(vfs, "/sd")
-        except OSError as mount_exc:
-            if mount_exc.errno == 16:  # EBUSY — boot.py's C-level mount persists
-                already_mounted = True
-            else:
-                raise
-
-        # Confirm /sd is the real SD card, not CIRCUITPY's plain sd/ folder.
-        # CIRCUITPY flash is ~3.9 MB; any real SD card is at least tens of MB.
-        try:
-            st = os.statvfs("/sd")
-            total_bytes = st[1] * st[2]
-        except Exception:  # noqa: BLE001
-            total_bytes = 0
-
-        if total_bytes < 10 * 1024 * 1024:  # < 10 MB → CIRCUITPY directory, not SD
-            _result(
-                "SD card mount",
-                False,
-                f"/sd is CIRCUITPY flash ({total_bytes // 1024} KB) — "
-                "real SD card not mounted.  Check boot.py and wiring.",
-            )
-            return False
-
-        src = "boot.py C-level mount (EBUSY)" if already_mounted else "mounted at /sd"
-        _result("SD card mount", True, src)
-
-        with open("/sd/mounted.txt", "w") as f:
-            f.write("SD card mounted OK\n")
-            f.flush()
-        _result("SD card write", True)
-
-        entries = os.listdir("/sd")
-        _log(f"    /sd contents: {entries}")
-        _sd_available = True
-        return True
-    except Exception as exc:  # noqa: BLE001
-        _result("SD card", False, str(exc))
+    ok, detail, entries = verify_sd()
+    if not ok:
+        _result("SD card", False, detail)
         return False
+    _result("SD card mount", True, detail)
+    _result("SD card write", True)
+    _log(f"    /sd contents: {entries}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -236,16 +131,8 @@ def _verify_sd() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _check_disk() -> None:
-    """Report filesystem usage for / and /sd.
-
-    Internal flash (/): os.statvfs("/") is used directly — this works correctly
-    and reports the CIRCUITPY FAT partition (~3.9 MB of the 8 MB SPI flash; the
-    remainder is consumed by the CircuitPython firmware partition).
-
-    SD card (/sd): capacity and free space via os.statvfs("/sd").  Used bytes
-    are computed by walking the tree with os.listdir + os.stat.
-    """
+def _check_disk(sd_available: bool) -> None:
+    """Report filesystem usage for / and /sd."""
     _section("Disk Usage")
     import os  # noqa: PLC0415
 
@@ -280,7 +167,6 @@ def _check_disk() -> None:
                 pass
         return files, dirs, nbytes
 
-    # --- Internal flash (/) ---
     try:
         st    = os.statvfs("/")
         block = st[1]
@@ -295,9 +181,8 @@ def _check_disk() -> None:
     except Exception as exc:  # noqa: BLE001
         _log(f"  /  unavailable ({exc})")
 
-    # --- SD card (/sd) ---
     _log("  SD card  /sd")
-    if not _sd_available:
+    if not sd_available:
         _log("    unavailable — SD card not accessible (see SD card section above)")
         return
 
@@ -318,29 +203,23 @@ def _check_disk() -> None:
             _log(f"    used   : {_fmt_bytes(used_bytes)}  ({pct:.1f}%)")
             _log(f"    free   : {_fmt_bytes(sd_free)}")
         else:
-            _log(f"    used   : {_fmt_bytes(used_bytes)}  (visible files only; total unavailable)")
+            _log(f"    used   : {_fmt_bytes(used_bytes)}  (total unavailable)")
         _log(f"    files  : {file_count}  dirs : {dir_count}")
     except Exception as exc:  # noqa: BLE001
         _log(f"    unavailable ({exc})")
 
 
 # ---------------------------------------------------------------------------
-# System resources — programmatic htop-style snapshot
+# System resources
 # ---------------------------------------------------------------------------
 
 
 def _check_system() -> None:
-    """One-shot snapshot of CPU, memory, runtime, network, firmware.
-
-    CircuitPython on ESP32 doesn't expose the FreeRTOS task table, per-core
-    CPU counters, or heap_caps_get_info from the underlying ESP-IDF, so this
-    is the maximum useful resolution available from pure Python.
-    """
+    """One-shot snapshot of CPU, memory, runtime, network, firmware."""
     _section("System Resources")
-    import gc                  # noqa: PLC0415
-    import os                  # noqa: PLC0415
+    import gc  # noqa: PLC0415
+    import os  # noqa: PLC0415
 
-    # --- Firmware ---
     try:
         u = os.uname()
         _log("  Firmware")
@@ -351,9 +230,7 @@ def _check_system() -> None:
     except Exception as exc:  # noqa: BLE001
         _log(f"  Firmware info unavailable ({exc})")
 
-    # --- CPU ---
     def _fmt(val, spec: str, suffix: str = "") -> str:
-        # Some CP builds return None instead of raising for unsupported props.
         if val is None:
             return "n/a"
         try:
@@ -374,7 +251,6 @@ def _check_system() -> None:
         temp_c  = _safe_get(cpu, "temperature")
         volts   = _safe_get(cpu, "voltage")
         reset   = _safe_get(cpu, "reset_reason")
-
         _log("  CPU")
         _log(f"    frequency  : {_fmt(freq_hz / 1_000_000 if freq_hz else None, '.0f', ' MHz')}")
         _log(f"    temperature: {_fmt(temp_c, '.1f', ' C')}")
@@ -389,9 +265,6 @@ def _check_system() -> None:
     except Exception as exc:  # noqa: BLE001
         _log(f"  CPU info unavailable ({exc})")
 
-    # --- Memory (heap) ---
-    # Time the gc.collect() call as a proxy for "load":  longer pauses imply a
-    # more fragmented or heavily allocated heap.
     t0 = time.monotonic_ns()
     gc.collect()
     gc_ms = (time.monotonic_ns() - t0) / 1_000_000
@@ -405,7 +278,6 @@ def _check_system() -> None:
     _log(f"    free       : {free // 1024} KB")
     _log(f"    gc.collect : {gc_ms:.1f} ms (load proxy)")
 
-    # --- Runtime ---
     try:
         import supervisor  # noqa: PLC0415
         rt = supervisor.runtime
@@ -427,7 +299,6 @@ def _check_system() -> None:
     except Exception as exc:  # noqa: BLE001
         _log(f"  Runtime info unavailable ({exc})")
 
-    # --- Network (WiFi) ---
     try:
         import wifi  # noqa: PLC0415
         radio = wifi.radio
@@ -463,14 +334,14 @@ def _check_system() -> None:
 
 
 # ---------------------------------------------------------------------------
-# PCF8523 RTC (Adalogger FeatherWing)
+# PCF8523 RTC
 # ---------------------------------------------------------------------------
 
 
-def _check_rtc(i2c):
+def _check_rtc():
     _section("PCF8523 RTC (Adalogger FeatherWing)")
     try:
-        rtc = PCF8523(i2c)
+        rtc = get_rtc()
         dt = rtc.datetime
         ts = (
             f"{dt.tm_year}-{dt.tm_mon:02d}-{dt.tm_mday:02d}"
@@ -494,7 +365,7 @@ def _check_ntp(rtc) -> bool:
         _result("NTP sync", False, "skipped — RTC not available")
         return False
     try:
-        ok = sync_rtc_from_ntp(rtc, tz_offset=_NTP_TZ_OFFSET)
+        ok = sync_rtc_from_ntp(rtc)
         if ok:
             _result("NTP sync", True, "")
             return True
@@ -504,8 +375,8 @@ def _check_ntp(rtc) -> bool:
                 hint = "WiFi not connected — check CIRCUITPY_WIFI_SSID/PASSWORD"
             else:
                 hint = (
-                    f"WiFi up (ip={wifi.radio.ipv4_address}, gw={wifi.radio.ipv4_gateway}); "
-                    "router/ISP likely blocking UDP/123 or no internet route"
+                    f"WiFi up (ip={wifi.radio.ipv4_address}); "
+                    "router/ISP likely blocking UDP/123"
                 )
         except Exception:  # noqa: BLE001
             hint = "WiFi state unavailable"
@@ -521,8 +392,9 @@ def _check_ntp(rtc) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _scan_i2c(i2c) -> list:
+def _scan_i2c() -> list:
     _section("I2C Bus Scan")
+    i2c = get_i2c()
     while not i2c.try_lock():
         pass
     try:
@@ -533,22 +405,22 @@ def _scan_i2c(i2c) -> list:
     if found:
         _log(f"  Found {len(found)} device(s): {[hex(a) for a in found]}")
         for addr in found:
-            label = _KNOWN_I2C_ADDRS.get(addr, "Unknown device")
-            _log(f"    {hex(addr):<6}  {label}")
+            name = _KNOWN_I2C_ADDRS.get(addr, "Unknown device")
+            _log(f"    {hex(addr):<6}  {name}")
     else:
         _log("  No I2C devices found — check wiring and bus frequency!")
     return found
 
 
 # ---------------------------------------------------------------------------
-# Sensor checks — each delegates all sensor logic to SensorClass.verify()
+# Sensor checks — each delegates all sensor logic to the reader class
 # ---------------------------------------------------------------------------
 
 
-def _check_bmp390(i2c):
+def _check_bmp390():
     _section("BMP390 Barometric Sensor")
     try:
-        data = BarometricReader.verify(i2c)
+        data = BarometricReader.verify()
         _result("BMP390", True, f"pressure={data.pressure:.2f} hPa  temp={data.temperature:.2f} C")
         return data
     except Exception as exc:  # noqa: BLE001
@@ -556,10 +428,10 @@ def _check_bmp390(i2c):
         return None
 
 
-def _check_shtc3(i2c):
+def _check_shtc3():
     _section("SHTC3 Temperature / Humidity Sensor")
     try:
-        data = TempHumidityReader.verify(i2c)
+        data = TempHumidityReader.verify()
         _result("SHTC3", True, f"temp={data.temperature:.2f} C  hum={data.relative_humidity:.1f} %RH")
         return data
     except Exception as exc:  # noqa: BLE001
@@ -567,11 +439,11 @@ def _check_shtc3(i2c):
         return None
 
 
-def _check_hm3301(i2c):
+def _check_hm3301():
     _section("HM3301 Air Quality Sensor")
     _log(f"  Waiting {AirQualityReader._VERIFY_WARMUP_S:.0f}s for warmup …")
     try:
-        data = AirQualityReader.verify(i2c)
+        data = AirQualityReader.verify()
         _result("HM3301", True,
                 f"PM1.0={data.pm_1_0_atm}  PM2.5={data.pm_2_5_atm}  PM10={data.pm_10_atm} ug/m3")
         return data
@@ -581,146 +453,26 @@ def _check_hm3301(i2c):
 
 
 def _check_mic():
-    # Skipped until CircuitPython PR #10990 (audio_i2sin.I2SIn) merges and a
-    # nightly/stable build is available for the ESP32 Feather V2.
     _section("SPH0645 I2S MEMS Microphone #3421")
     _log("  [SKIP] audio_i2sin not in stock 10.2.0 — awaiting PR #10990")
     return None
 
 
 # ---------------------------------------------------------------------------
-# OLED FeatherWing #4650 (SH1107 128×64)
+# OLED check — verify the DisplayController is operational
 # ---------------------------------------------------------------------------
 
 
-def _check_oled(i2c):
-    """Initialise the SH1107 display and render a diagnostic splash screen."""
-    global _oled_display  # noqa: PLW0603
+def _check_oled(display: DisplayController) -> bool:
+    """Render a diagnostic splash and confirm the display is working."""
     _section("OLED FeatherWing #4650 (SH1107 128x64)")
     try:
-        displayio.release_displays()
-        display_bus = i2cdisplaybus.I2CDisplayBus(i2c, device_address=0x3C)
-        display = SH1107(
-            display_bus,
-            width=128,
-            height=64,
-            display_offset=DISPLAY_OFFSET_ADAFRUIT_FEATHERWING_OLED_4650,
-            rotation=270,
-        )
-        group = displayio.Group()
-        group.append(label.Label(terminalio.FONT, text="FeatherWeather",  x=0, y=6,  color=0xFFFFFF))
-        group.append(label.Label(terminalio.FONT, text="DIAG MODE",       x=0, y=20, color=0xFFFFFF))
-        group.append(label.Label(terminalio.FONT, text="I2C 0x3C  OK",    x=0, y=34, color=0xFFFFFF))
-        group.append(label.Label(terminalio.FONT, text="Running checks..", x=0, y=48, color=0xFFFFFF))
-        display.root_group = group
+        display.display("FeatherWeather", "DIAG MODE", "I2C 0x3C  OK", "Running checks..")
         _result("SH1107", True, "I2C 0x3C, 128x64, rotation=270")
-        _oled_display = display
-        return display
+        return True
     except Exception as exc:  # noqa: BLE001
         _result("SH1107", False, str(exc))
-        return None
-
-
-def _update_oled_summary(passed: int, failed: int) -> None:
-    """Overwrite the OLED splash with the final pass/fail summary."""
-    if _oled_display is None:
-        return
-    try:
-        total = passed + failed
-        status = "ALL PASS" if failed == 0 else f"{failed}/{total} FAIL"
-        group = displayio.Group()
-        group.append(label.Label(terminalio.FONT, text="FeatherWeather",  x=0, y=6,  color=0xFFFFFF))
-        group.append(label.Label(terminalio.FONT, text="DIAG COMPLETE",   x=0, y=20, color=0xFFFFFF))
-        group.append(label.Label(terminalio.FONT, text=f"Pass: {passed}", x=0, y=34, color=0xFFFFFF))
-        group.append(label.Label(terminalio.FONT, text=f"Fail: {failed}", x=0, y=48, color=0xFFFFFF))
-        group.append(label.Label(terminalio.FONT, text=status,            x=0, y=58, color=0xFFFFFF))
-        _oled_display.root_group = group
-    except Exception:  # noqa: BLE001
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Peripheral shutdown — OLED + NeoPixel left on after the run is confusing
-# (looks like the script is still doing something).  Power them down cleanly.
-# ---------------------------------------------------------------------------
-
-
-def _shutdown_neopixel() -> None:
-    """Force the NeoPixel dark and release the GPIO so the data line idles low."""
-    if _pixel is None:
-        return
-    try:
-        _pixel.fill(_OFF)
-        _pixel.deinit()
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _done_loop(_i2c) -> None:
-    """Hold the OLED summary on screen, then let any OLED button toggle it.
-
-    After _SHUTDOWN_LINGER_S the display is blanked by assigning an empty
-    displayio.Group (all pixels off on OLED — no sleep property needed).
-    Pressing any of the three OLED FeatherWing buttons toggles between the
-    blank screen and the pass/fail summary.  The loop runs forever until the
-    device is reset — the script must never exit or CircuitPython drops to
-    the REPL.
-
-    Button layout on Adafruit Feather ESP32 V2 (board pins differ from SAMD):
-      TOP    Button C  board.A8  GPIO15
-      MIDDLE Button B  board.A7  GPIO32
-      BOTTOM Button A  board.A6  GPIO37  (input-only; FeatherWing pulls up externally)
-    """
-    if _SHUTDOWN_LINGER_S > 0:
-        time.sleep(_SHUTDOWN_LINGER_S)
-
-    blank_group = None
-    if _oled_display is not None:
-        try:
-            blank_group = displayio.Group()
-            _oled_display.root_group = blank_group
-        except Exception:  # noqa: BLE001
-            blank_group = None
-
-    showing = False
-
-    # Feather ESP32 V2 button pins confirmed by live pin scan.
-    # A6 (GPIO37) is input-only on ESP32 — no internal pull resistor, but the
-    # OLED FeatherWing PCB provides external pull-ups on all button lines.
-    _BTN_DEFS = [
-        ("TOP (C)",    "A8"),   # GPIO15
-        ("MIDDLE (B)", "A7"),   # GPIO32
-        ("BOTTOM (A)", "A6"),   # GPIO37 — input-only, rely on external pull-up
-    ]
-    buttons = []
-    for btn_label, pin_name in _BTN_DEFS:
-        try:
-            dio = digitalio.DigitalInOut(getattr(board, pin_name))
-            try:
-                dio.switch_to_input(pull=digitalio.Pull.UP)
-            except (ValueError, AttributeError):
-                dio.switch_to_input(pull=None)  # input-only GPIO
-            buttons.append((btn_label, dio))
-        except Exception:  # noqa: BLE001
-            pass
-
-    last_press = time.monotonic()
-    while True:
-        for lbl, dio in buttons:
-            if not dio.value:
-                now = time.monotonic()
-                if (now - last_press) > _DEBOUNCE_S:
-                    last_press = now
-                    showing = not showing
-                    if blank_group is not None:
-                        try:
-                            if showing:
-                                _update_oled_summary(_pass_count, _fail_count)
-                            else:
-                                _oled_display.root_group = blank_group
-                        except Exception:  # noqa: BLE001
-                            pass
-        time.sleep(0.05)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -732,14 +484,11 @@ def _check_gps():
     _section("Ultimate GPS FeatherWing")
     _log(f"  NMEA timeout={_GPS_NMEA_CHECK_S:.0f}s  fix timeout={_GPS_FIX_TIMEOUT_S:.0f}s")
     try:
-        uart = busio.UART(board.TX, board.RX, baudrate=_GPS_BAUD, timeout=0.1)
         data = GpsReader.verify(
-            uart,
             nmea_timeout_s=_GPS_NMEA_CHECK_S,
             fix_timeout_s=_GPS_FIX_TIMEOUT_S,
         )
     except RuntimeError as exc:
-        # RuntimeError from verify() means no NMEA — real wiring problem
         _result("GPS NMEA activity", False, str(exc))
         return None, False
     except Exception as exc:  # noqa: BLE001
@@ -761,7 +510,6 @@ def _check_gps():
             f"  alt={data.altitude_m:.1f}m  sats={data.satellites}  utc={ts}",
         )
     else:
-        # No fix indoors/cold-start is normal — NMEA activity proves the module works
         _result("GPS fix (no fix yet)", True, "module alive, needs clear sky view")
 
     return data, data.has_fix
@@ -782,8 +530,6 @@ def _write_report(rtc) -> None:
     else:
         stamped_sd = None
 
-    # Always write diag_latest.txt on /sd — easy to find regardless of RTC state.
-    # Also write the timestamped copy when the RTC provided a valid datetime.
     all_targets = ["/sd/diag_latest.txt"]
     if stamped_sd is not None:
         all_targets.append(stamped_sd)
@@ -792,14 +538,49 @@ def _write_report(rtc) -> None:
         try:
             with open(filename, "w") as f:
                 for line in _report_lines:
-                    # Write only ASCII — strip non-ASCII chars to avoid
-                    # FAT write errors on some CircuitPython builds
                     safe = "".join(c if ord(c) < 128 else "?" for c in line)
                     f.write(safe + "\n")
                 f.flush()
             print(f"Report saved -> {filename}")
         except Exception as exc:  # noqa: BLE001
             print(f"Failed to write {filename}: {exc}")
+
+
+
+
+# ---------------------------------------------------------------------------
+# Done loop — hold OLED summary, toggle on button press
+# ---------------------------------------------------------------------------
+
+
+def _done_loop(display: DisplayController, passed: int, failed: int) -> None:
+    """Hold the OLED summary, then let any button toggle it on/off.
+
+    Displays a final pass/fail summary for _SHUTDOWN_LINGER_S seconds,
+    then blanks the screen.  Any OLED button press toggles between the
+    summary and blank until the device is reset.  The loop never returns.
+    """
+    total = passed + failed
+    status = "ALL PASS" if failed == 0 else f"{failed}/{total} FAIL"
+    summary = ("FeatherWeather", "DIAG COMPLETE", f"Pass: {passed}  {status}", f"Fail: {failed}")
+
+    display.display(*summary)
+    time.sleep(_SHUTDOWN_LINGER_S)
+    display.blank()
+
+    showing = False
+    last_press = time.monotonic()
+    while True:
+        if display.any_button_pressed():
+            now = time.monotonic()
+            if (now - last_press) > _DEBOUNCE_S:
+                last_press = now
+                showing = not showing
+                if showing:
+                    display.display(*summary)
+                else:
+                    display.blank()
+        time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -810,44 +591,49 @@ _log("FeatherWeather Diagnostic Mode")
 _log(f"Started  monotonic={time.monotonic():.1f}s")
 _log("Checking: BMP390, HM3301, SHTC3, PCF8523 RTC, SH1107 OLED, SPH0645 mic, GPS, SD card")
 
-# Release any display left active by the previous code.py run before
-# claiming the I2C bus — the previous run's I2CDisplayBus holds SCL/SDA.
-displayio.release_displays()
+# DisplayController calls displayio.release_displays() internally and acquires
+# the shared I2C bus — must be created first.
+try:
+    _display = DisplayController()
+    print("[init] DisplayController OK")
+except Exception as _exc:  # noqa: BLE001
+    _display = None
+    print(f"[init] DisplayController FAILED: {_exc}")
 
-# I2C bus at 20 kHz — required for HM3301; all other I2C devices tolerate this
-i2c = busio.I2C(board.SCL, board.SDA, frequency=_I2C_FREQ_HZ)
-
-# SD card — mounted here in code.py's VM (boot.py mount is torn down before
-# code.py starts; see boot.py for details).
-sd_ok = _verify_sd()
+# SD card
+sd_ok = _check_sd()
 _track(sd_ok)
 
 # RTC provides the timestamp used in the report filename
-rtc = _check_rtc(i2c)
+rtc = _check_rtc()
 _track(rtc is not None)
 
-# Sync RTC from NTP — fixes unset / drifted time before the filename is stamped
+# Sync RTC from NTP
 ntp_ok = _check_ntp(rtc)
 _track(ntp_ok)
 
 # Enumerate all I2C addresses before probing individual sensors
-i2c_addrs = _scan_i2c(i2c)
+i2c_addrs = _scan_i2c()
 
-# OLED — checked early so the display can show progress during remaining tests
-oled_display = _check_oled(i2c)
-_track(oled_display is not None)
+# OLED — verify the DisplayController is functional
+if _display is not None:
+    oled_ok = _check_oled(_display)
+else:
+    _section("OLED FeatherWing #4650 (SH1107 128x64)")
+    _result("SH1107", False, "DisplayController init failed")
+    oled_ok = False
+_track(oled_ok)
 
 # Individual sensor checks
-baro_data = _check_bmp390(i2c)
+baro_data = _check_bmp390()
 _track(baro_data is not None)
 
-th_data = _check_shtc3(i2c)
+th_data = _check_shtc3()
 _track(th_data is not None)
 
-aq_data = _check_hm3301(i2c)
+aq_data = _check_hm3301()
 _track(aq_data is not None)
 
-# Microphone is on I2S bus (D27/D13/A2), independent of I2C
 mic_data = _check_mic()
 # Not tracked — skipped until audio_i2sin firmware support lands
 
@@ -856,10 +642,8 @@ gps, gps_has_fix = _check_gps()
 gps_alive = gps is not None
 _track(gps_alive)
 
-# Disk usage
-_check_disk()
-
-# System resources (htop-style snapshot — informational, not tracked)
+# Disk usage and system info (informational)
+_check_disk(sd_ok)
 _check_system()
 
 # ---------------------------------------------------------------------------
@@ -871,7 +655,7 @@ _section("Diagnostic Summary")
 _result("SD card",             sd_ok)
 _result("PCF8523 RTC",         rtc is not None)
 _result("NTP sync",            ntp_ok)
-_result("SH1107 OLED",         oled_display is not None)
+_result("SH1107 OLED",         oled_ok)
 _result("BMP390 Barometric",   baro_data is not None)
 _result("SHTC3 Temp/Humidity", th_data is not None)
 _result("HM3301 Air Quality",  aq_data is not None)
@@ -894,19 +678,16 @@ _log(f"Tests: {total_tests}  passed={_pass_count}  failed={_fail_count}")
 _log("Overall: " + ("ALL SYSTEMS GO" if all_ok else "ISSUES DETECTED — see details above"))
 _log()
 
-# NeoPixel summary flash:
-#   All passed  → green × total_tests
-#   < 50% failed → yellow × failed_count
-#   ≥ 50% failed → red × failed_count
-if all_ok:
-    _flash(_GREEN, count=total_tests, on_ms=300, off_ms=150)
-elif fail_pct < 50.0:
-    _flash(_YELLOW, count=_fail_count, on_ms=300, off_ms=150)
-else:
-    _flash(_RED, count=_fail_count, on_ms=300, off_ms=150)
+_pixel.flash_summary(_pass_count, _fail_count)
 
 # Update OLED with final pass/fail counts
-_update_oled_summary(_pass_count, _fail_count)
+if _display is not None:
+    _display.display(
+        "FeatherWeather",
+        "DIAG COMPLETE",
+        f"Pass: {_pass_count}",
+        f"Fail: {_fail_count}",
+    )
 
 # ---------------------------------------------------------------------------
 # Persist report to SD card
@@ -919,11 +700,12 @@ else:
 
 _log("Diagnostic complete.")
 
-# NeoPixel is done — release it now so the data line idles low.
-_shutdown_neopixel()
+_pixel.deinit()
 
-# Hold the OLED summary for _SHUTDOWN_LINGER_S, then blank the panel.
-# Any OLED button (A=A6, B=A7, C=A8 on Feather ESP32 V2) toggles the
-# summary on/off until reset. This loop never returns — exiting would
-# drop CircuitPython to the REPL.
-_done_loop(i2c)
+# Hold the OLED summary and respond to button presses until reset.
+# This loop never returns — exiting would drop CircuitPython to the REPL.
+if _display is not None:
+    _done_loop(_display, _pass_count, _fail_count)
+else:
+    while True:
+        time.sleep(1)

@@ -8,10 +8,15 @@ NMEA sentences enabled:
     GGA — position, altitude, fix quality, satellites, HDOP
     RMC — position, speed, heading, date/time
 
+Pin assignments (fixed to match the FeatherWeather PCB layout):
+    TX   board.TX  (GPS RX)
+    RX   board.RX  (GPS TX)
+
+Environment variables:
+    GPS_BAUD  UART baud rate (default 9600)
+
 Usage (CircuitPython):
-    import busio, board
-    uart = busio.UART(board.TX, board.RX, baudrate=9600, timeout=0.1)
-    reader = GpsReader(uart)
+    reader = GpsReader()
 
     # Block until fix (or timeout) during startup:
     fixed = reader.wait_for_fix(timeout_s=120)
@@ -27,19 +32,21 @@ Reference:
     https://cdn.sparkfun.com/assets/parts/1/2/2/8/0/PMTK_Packet_User_Manual.pdf
 """
 
+import os
 import time
 
 import adafruit_gps
+import board
+import busio
 
 from featherweather.gps.gps_data import GpsData
 
 __all__ = ["GpsReader"]
 
 # Enable GGA and RMC sentences only (position, altitude, speed, time).
-# All other sentence types disabled to reduce UART traffic.
 _PMTK_SET_NMEA_OUTPUT = b"PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0"
 
-# 1 Hz update rate (1000 ms between fixes)
+# 1 Hz update rate
 _PMTK_SET_UPDATE_RATE = b"PMTK220,1000"
 
 _WAIT_POLL_INTERVAL_S: float = 0.5
@@ -48,8 +55,9 @@ _WAIT_POLL_INTERVAL_S: float = 0.5
 class GpsReader:
     """CircuitPython reader for the Ultimate GPS FeatherWing (adafruit #3133).
 
-    Wraps adafruit_gps.GPS to provide the same _data / _reader interface as
-    the rest of the FeatherWeather sensor modules.
+    Initialises its own UART on board.TX / board.RX.  Wraps adafruit_gps.GPS
+    to provide the same read() / update() interface as the rest of the
+    FeatherWeather sensor modules.
 
     The caller is responsible for polling update() regularly (e.g. every
     200 ms) so the UART receive buffer does not overflow between reads.
@@ -59,14 +67,12 @@ class GpsReader:
     @classmethod
     def verify(
         cls,
-        uart,
         nmea_timeout_s: float = 5.0,
         fix_timeout_s: float = 30.0,
     ) -> "GpsData":
         """Verify the GPS module is alive and attempt a fix.
 
         Args:
-            uart:           busio.UART connected to the GPS FeatherWing
             nmea_timeout_s: seconds to wait for the first parsed NMEA sentence
             fix_timeout_s:  seconds to attempt a fix after NMEA is confirmed
 
@@ -77,7 +83,7 @@ class GpsReader:
             RuntimeError if no NMEA sentences are received within nmea_timeout_s
             (indicates a wiring or baud-rate problem).
         """
-        reader = cls(uart)
+        reader = cls()
 
         deadline = time.monotonic() + nmea_timeout_s
         nmea_seen = False
@@ -99,12 +105,14 @@ class GpsReader:
 
         return reader.read()
 
-    def __init__(self, uart, debug: bool = False) -> None:
-        """
+    def __init__(self, debug: bool = False) -> None:
+        """Initialise the GPS UART and configure sentence output.
+
         Args:
-            uart:  busio.UART at 9600 8N1 connected to the GPS FeatherWing
             debug: if True, adafruit_gps prints raw NMEA sentences to serial
         """
+        baud = int(os.getenv("GPS_BAUD") or 9600)
+        uart = busio.UART(board.TX, board.RX, baudrate=baud, timeout=0.1)
         self._gps = adafruit_gps.GPS(uart, debug=debug)
         self._gps.send_command(_PMTK_SET_NMEA_OUTPUT)
         self._gps.send_command(_PMTK_SET_UPDATE_RATE)
@@ -154,9 +162,7 @@ class GpsReader:
         the UART at _WAIT_POLL_INTERVAL_S intervals.
 
         Args:
-            timeout_s: maximum seconds to wait (default 120 s — cold-start
-                       time for the MTK3333 is typically 15-45 s with a
-                       clear sky view)
+            timeout_s: maximum seconds to wait (default 120 s)
 
         Returns:
             True if a fix was acquired, False if the timeout was reached.

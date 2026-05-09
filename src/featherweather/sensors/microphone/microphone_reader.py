@@ -43,6 +43,8 @@ except ImportError:
     _I2SIn = None
 
 from featherweather.sensors.microphone.microphone_data import MicrophoneData
+from featherweather.sensors.sensor_base import SensorBase
+from featherweather.storage.weather_payload import WeatherPayload
 
 __all__ = ["MicrophoneReader"]
 
@@ -61,7 +63,7 @@ _SENSITIVITY_OFFSET_DB: float = 120.0
 _DEFAULT_NUM_SAMPLES: int = 512
 
 
-class MicrophoneReader:
+class MicrophoneReader(SensorBase):
     """CircuitPython sound-level reader for the SPH0645LM4H-LB MEMS microphone.
 
     Records a burst of I2S samples via audio_i2sin.I2SIn, removes DC offset,
@@ -85,12 +87,14 @@ class MicrophoneReader:
         """
         reader = cls()
         try:
-            data = reader.read()
+            payload = WeatherPayload()
+            reader.read(payload)
         finally:
             reader.deinit()
-        if data.rms < cls._VERIFY_MIN_RMS:
+        data = payload.microphone
+        if data is None or data.rms < cls._VERIFY_MIN_RMS:
             raise RuntimeError(
-                f"mic samples near-zero (rms={data.rms:.1f}) — check wiring/SEL pin"
+                f"mic samples near-zero (rms={data.rms if data else 0:.1f}) — check wiring/SEL pin"
             )
         return data
 
@@ -122,14 +126,16 @@ class MicrophoneReader:
     # Public API
     # ------------------------------------------------------------------
 
-    def read(self) -> MicrophoneData:
-        """Record one burst of samples and return amplitude / level data.
+    def read(self, payload: WeatherPayload) -> None:
+        """Record one burst of samples and set payload.microphone.
 
-        Returns:
-            MicrophoneData with rms, db_fs, and db_spl populated.
+        Args:
+            payload: in-progress WeatherPayload; payload.microphone is written.
         """
         self._mic.record(self._buf, self._n)
-        return self._compute(self._buf, self._n)
+        data = self._compute(self._buf, self._n)
+        print(data)
+        payload.microphone = data
 
     def deinit(self) -> None:
         """Release the I2S peripheral."""

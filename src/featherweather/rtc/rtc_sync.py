@@ -23,9 +23,29 @@ Optional settings.toml knobs:
 import os
 import time
 
-__all__ = ["sync_rtc_from_ntp"]
+__all__ = ["get_rtc", "sync_rtc_from_ntp", "PCF8523_I2C_ADDR", "PCF8523_LABEL"]
+
+PCF8523_I2C_ADDR: int = 0x68
+PCF8523_LABEL: str = "PCF8523 (Adalogger RTC)"
 
 _DEFAULT_SERVERS = "pool.ntp.org,time.google.com,time.cloudflare.com"
+
+
+def get_rtc():
+    """Create and return a PCF8523 RTC on the shared I2C bus.
+
+    The PCF8523 lives on the Adalogger FeatherWing (I2C address 0x68).
+    Uses the shared bus from ``featherweather.hardware.i2c_bus`` so no
+    separate I2C object is needed in code.py or diagnostic.py.
+
+    Returns:
+        adafruit_pcf8523.pcf8523.PCF8523 instance ready for use.
+    """
+    import adafruit_pcf8523.pcf8523 as _pcf8523_mod  # noqa: PLC0415
+
+    from featherweather.hardware.i2c_bus import get_i2c  # noqa: PLC0415
+
+    return _pcf8523_mod.PCF8523(get_i2c())
 _WIFI_WAIT_S = 15.0
 _POLL_INTERVAL_S = 0.5
 

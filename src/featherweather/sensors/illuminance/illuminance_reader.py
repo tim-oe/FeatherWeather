@@ -7,61 +7,53 @@ Modbus RTU registers (default slave address 0x01):
 
 Reference: https://wiki.dfrobot.com/sen0644/docs/19609
 
+Environment variable:
+    ILLUMINANCE_ADDR  Modbus slave address, hex or decimal (default 0x01)
+
 Usage:
-    import busio, board, digitalio
-    uart = busio.UART(board.TX, board.RX, baudrate=9600, timeout=0.5)
-    de = digitalio.DigitalInOut(board.D5)
-    de.direction = digitalio.Direction.OUTPUT
-    reader = IlluminanceReader(uart, de)
-    data = reader.read()
+    reader = IlluminanceReader()
+    reader.read(payload)           # populates payload.illuminance
 """
 
 from featherweather.sensors.illuminance.illuminance_data import IlluminanceData
-from featherweather.sensors.rs485.modbus_rtu import ModbusRtu
+from featherweather.sensors.rs485.rs485_sensor_base import Rs485SensorBase
+from featherweather.storage.weather_payload import WeatherPayload
 
 __all__ = ["IlluminanceReader"]
 
-_DEFAULT_ADDRESS: int = 0x01
 _REG_LUX_HIGH: int = 0x0002
 _REG_DEVICE_ADDR: int = 0x0064
 
 _LUX_SCALE: float = 1000.0
 
 
-class IlluminanceReader:
+class IlluminanceReader(Rs485SensorBase):
     """CircuitPython reader for the SEN0644 RS485 ambient light sensor.
 
     The illuminance value is a 32-bit integer split across two consecutive
     16-bit registers (high word at 0x0002, low word at 0x0003).
-    Divide the combined value by 1000 to get lux.
+
+    Modbus address defaults to 0x01; override with ``ILLUMINANCE_ADDR`` or
+    the ``address`` constructor argument.
     """
 
-    def __init__(self, uart, de_pin, address: int = _DEFAULT_ADDRESS) -> None:
-        """
+    _DEFAULT_ADDRESS: int = 0x01
+    _ENV_ADDRESS_VAR: str = "ILLUMINANCE_ADDR"
+
+    def read(self, payload: WeatherPayload) -> None:
+        """Read ambient illuminance from the SEN0644 and set payload.illuminance.
+
         Args:
-            uart:    busio.UART at 9600 8N1 connected to MAX3485
-            de_pin:  digitalio.DigitalInOut for MAX3485 DE / ~RE
-            address: Modbus slave address (default 0x01)
-        """
-        self._modbus = ModbusRtu(uart, de_pin)
-        self._address = address
-
-    def read(self) -> IlluminanceData:
-        """Read ambient illuminance from the SEN0644.
-
-        Returns:
-            IlluminanceData with lux value (0.0 - 200,000.0)
+            payload: in-progress WeatherPayload; payload.illuminance is written.
         """
         regs = self._modbus.read_registers(self._address, _REG_LUX_HIGH, count=2)
         raw = (regs[0] << 16) | regs[1]
         data = IlluminanceData()
         data.lux = raw / _LUX_SCALE
-        return data
+        print(data)
+        payload.illuminance = data
 
     def set_address(self, new_address: int) -> None:
-        """Reassign the Modbus slave address (persisted in sensor flash).
-
-        Power-cycle the sensor after calling this method.
-        """
+        """Reassign the Modbus slave address (persisted in sensor flash)."""
         self._modbus.write_register(self._address, _REG_DEVICE_ADDR, new_address)
         self._address = new_address
