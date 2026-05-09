@@ -23,7 +23,8 @@ Usage:
 Firmware requirement:
     Requires a CircuitPython build that includes the `audio_i2sin` module
     (added in PR #10990 — not in the 10.2.0 release).
-    Download a dev/nightly build from https://circuitpython.org/board/adafruit_feather_esp32_v2/
+    Download a dev/nightly build from
+    https://circuitpython.org/board/adafruit_feather_esp32_v2/
     Once merged and released, `audio_i2sin` will be available in a stable build.
 
     If the module is absent (e.g. stock 10.2.0), construction raises
@@ -94,7 +95,8 @@ class MicrophoneReader(SensorBase):
         data = payload.microphone
         if data is None or data.rms < cls._VERIFY_MIN_RMS:
             raise RuntimeError(
-                f"mic samples near-zero (rms={data.rms if data else 0:.1f}) — check wiring/SEL pin"
+                f"mic samples near-zero (rms={data.rms if data else 0:.1f})"
+                f" — check wiring/SEL pin"
             )
         return data
 

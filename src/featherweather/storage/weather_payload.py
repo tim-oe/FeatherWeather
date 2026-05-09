@@ -28,6 +28,7 @@ from featherweather.sensors.temp_humidity.temp_humidity_data import TempHumidity
 from featherweather.sensors.wind_direction.wind_direction_data import WindDirectionData
 from featherweather.sensors.wind_speed.wind_speed_data import WindSpeedData
 from featherweather.storage.serializer import to_json
+from featherweather.system.system_data import SystemData
 
 __all__ = ["WeatherPayload"]
 
@@ -49,6 +50,7 @@ class WeatherPayload:
         illuminance:    ambient light in lux
         microphone:     RMS amplitude, dBFS, and estimated dB SPL
         gps:            fix status, coordinates, altitude, and UTC timestamp
+        system:         heap usage, CPU clock, temperature, and uptime
         last_read_s:    ``time.monotonic()`` timestamp of the most recent
                         completed sensor cycle
         ip_address:     device IP address when WiFi is available
@@ -65,6 +67,7 @@ class WeatherPayload:
         illuminance: IlluminanceData | None = None,
         microphone: MicrophoneData | None = None,
         gps: GpsData | None = None,
+        system: SystemData | None = None,
         last_read_s: float | None = None,
         ip_address: str | None = None,
     ) -> None:
@@ -77,6 +80,7 @@ class WeatherPayload:
         self.illuminance: IlluminanceData | None = illuminance
         self.microphone: MicrophoneData | None = microphone
         self.gps: GpsData | None = gps
+        self.system: SystemData | None = system
         self.last_read_s: float | None = last_read_s
         self.ip_address: str | None = ip_address
 

@@ -17,8 +17,8 @@ MQTT_TOPIC = "featherweather/data"
 
 NTP_TIMEZONE_OFFSET = -6  # UTC offset in hours (e.g. -6 for CST)
 
-# Sensor polling
-READ_INTERVAL_MINUTES = 5
+# Sensor polling interval in seconds (default 300 = 5 minutes)
+READ_INTERVAL_S = 300
 
 # UART baud rates
 GPS_BAUD = 9600

@@ -6,8 +6,6 @@ so no mocking is required beyond what conftest.py provides.
 
 import time
 
-import pytest
-
 from featherweather.gps.gps_data import GpsData
 from featherweather.sensors.air_quality.air_quality_data import AirQualityData
 from featherweather.sensors.barometric.barometric_data import BarometricData

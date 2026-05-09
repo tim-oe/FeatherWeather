@@ -4,11 +4,8 @@ All hardware (I2C, OLED, buttons) is mocked by conftest.py and per-test
 patches so that __init__ completes without physical hardware.
 """
 
-import sys
 from contextlib import contextmanager
-from unittest.mock import MagicMock, call, patch
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from featherweather.gps.gps_data import GpsData
 from featherweather.sensors.barometric.barometric_data import BarometricData
@@ -102,7 +99,7 @@ class TestDisplayControllerInit:
         monkeypatch.setenv("OLED_ADDR", "0x3C")
         from featherweather.display.display_controller import DisplayController
 
-        with _display_patches() as mocks:
+        with _display_patches():
             dc = DisplayController()
         # Constructor should complete without TypeError
         assert dc.payload is not None

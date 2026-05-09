@@ -225,7 +225,7 @@ def sync_rtc_from_ntp(rtc, tz_offset=0):
             )
             utc_time = ntp.datetime
 
-            # Resolve timezone — prefers NTP_TIMEZONE name, falls back to NTP_TIMEZONE_OFFSET
+            # Resolve timezone — prefers NTP_TIMEZONE, falls back to NTP_TIMEZONE_OFFSET
             std_offset, auto_dst = _resolve_tz()
             dst_mode = (os.getenv("NTP_DST") or "US").upper()
             dst_hours = (

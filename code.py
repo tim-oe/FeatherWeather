@@ -30,7 +30,7 @@ Modbus addresses (reprogram conflicting sensors before first use):
     SEN0644 Illuminance     0x01  (default)
 
 Environment variables (settings.toml):
-    READ_INTERVAL_MINUTES   sensor read cadence in minutes    (default 5)
+    READ_INTERVAL_S         sensor read cadence in seconds    (default 300)
     GPS_BAUD                GPS UART baud rate                (default 9600)
     RS485_BAUD              RS485 UART baud rate              (default 9600)
     RS485_TIMEOUT_MS        RS485 read timeout                (default 500)
@@ -41,6 +41,7 @@ Environment variables (settings.toml):
     ILLUMINANCE_ADDR        SEN0644 Modbus address            (default 0x01)
 """
 
+import gc
 import os
 import time
 
@@ -59,12 +60,13 @@ from featherweather.sensors.wind_direction.wind_direction_reader import WindDire
 from featherweather.sensors.wind_speed.wind_speed_reader import WindSpeedReader
 from featherweather.storage.sd_file_server import SdFileServer
 from featherweather.storage.weather_payload import WeatherPayload
+from featherweather.system.system_reader import SystemReader
 
 # ---------------------------------------------------------------------------
 # Configuration (read from settings.toml; defaults used when absent)
 # ---------------------------------------------------------------------------
 
-READ_INTERVAL_MINUTES: int = int(os.getenv("READ_INTERVAL_MINUTES") or 5)
+READ_INTERVAL_S: int = int(os.getenv("READ_INTERVAL_S") or 300)
 
 _LOOP_INTERVAL_S: float = 0.05    # main loop cadence — buttons polled at ~20 Hz
 _GPS_POLL_INTERVAL_S: float = 0.2  # poll GPS UART at 5 Hz
@@ -91,14 +93,9 @@ def _try_init(label: str, factory):
 # ---------------------------------------------------------------------------
 
 
-def _seconds_until_next_interval(rtc) -> float:
-    """Return seconds until the next READ_INTERVAL_MINUTES boundary."""
-    now = rtc.datetime
-    mins_past = now.tm_min % READ_INTERVAL_MINUTES
-    mins_left = (READ_INTERVAL_MINUTES - mins_past) % READ_INTERVAL_MINUTES
-    if mins_left == 0 and now.tm_sec > 0:
-        mins_left = READ_INTERVAL_MINUTES
-    return float(mins_left * 60 - now.tm_sec)
+def _seconds_until_next_interval() -> int:
+    """Return the configured read interval in seconds."""
+    return READ_INTERVAL_S
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +134,9 @@ def _run_sensor_cycle(
     now = rtc.datetime
     print(f"--- reading sensors at {now.tm_hour:02d}:{now.tm_min:02d} ---")
 
+    gc.collect()
+    mem_before = gc.mem_alloc()
+
     # Carry forward GPS and network metadata accumulated between sensor cycles.
     payload = WeatherPayload(
         gps=display.payload.gps,
@@ -147,12 +147,22 @@ def _run_sensor_cycle(
     for sensor in sensors:
         if sensor is None:
             continue
+        _before = gc.mem_alloc()
         try:
             sensor.read(payload)
         except Exception as exc:  # noqa: BLE001
             print(f"[{type(sensor).__name__}] error: {exc}")
+        _after = gc.mem_alloc()
+        print(f"  [mem] {type(sensor).__name__:<26} {_after - _before:+5d} B")
 
     display.update(payload)
+
+    gc.collect()
+    mem_after = gc.mem_alloc()
+    print(
+        f"  [mem] cycle total: {mem_after - mem_before:+d} B "
+        f"| alloc={mem_after // 1024} KB  free={gc.mem_free() // 1024} KB"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -199,10 +209,13 @@ def main() -> None:
     wind_spd = _try_init("SEN0483 (wind speed)",     WindSpeedReader)
     illum    = _try_init("SEN0644 (illuminance)",    IlluminanceReader)
 
+    # System metrics reader — always present (pure software, no hardware dependency)
+    sys_reader = SystemReader()
+
     # Ordered sensor list — passed to every _run_sensor_cycle call.
     # Adding a new sensor only requires inserting it here.
     sensors: list[SensorBase | None] = [
-        baro, temp_hum, aq, rain, mic, wind_dir, wind_spd, illum
+        baro, temp_hum, aq, rain, mic, wind_dir, wind_spd, illum, sys_reader
     ]
 
     # SD file server — non-blocking HTTP server on port 8080 for /sd/ access
@@ -222,7 +235,7 @@ def main() -> None:
     _run_sensor_cycle(rtc, sensors, display)
 
     # Schedule subsequent reads at fixed interval boundaries
-    next_read_mono = time.monotonic() + _seconds_until_next_interval(rtc)
+    next_read_mono = time.monotonic() + _seconds_until_next_interval()
     last_gps_poll = 0.0
     now = rtc.datetime
     print(
@@ -248,11 +261,11 @@ def main() -> None:
         # Sensor cycle — fires when the next interval boundary is reached
         if now_mono >= next_read_mono:
             _run_sensor_cycle(rtc, sensors, display)
-            next_read_mono = time.monotonic() + _seconds_until_next_interval(rtc)
+            next_read_mono = time.monotonic() + _seconds_until_next_interval()
             now = rtc.datetime
             print(
                 f"[{now.tm_hour:02d}:{now.tm_min:02d}:{now.tm_sec:02d}]"
-                f" next read in {_seconds_until_next_interval(rtc):.0f}s"
+                f" next read in {READ_INTERVAL_S}s"
             )
 
         time.sleep(_LOOP_INTERVAL_S)

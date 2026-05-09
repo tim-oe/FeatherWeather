@@ -12,7 +12,7 @@ Environment variable:
 
 Usage:
     reader = RainfallReader()
-    reader.read(payload)           # populates payload.rainfall (cumulative + 1hr window)
+    reader.read(payload)           # populates payload.rainfall (cumulative + 1hr)
     # or for diagnostics:
     data = RainfallReader.verify()
 """

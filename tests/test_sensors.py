@@ -9,8 +9,7 @@ Pattern for each reader:
     3. Test class-level constants (_I2C_ADDR, _LABEL) directly.
 """
 
-import sys
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -150,11 +149,9 @@ class TestBarometricReader:
         mock_sensor.pressure = 1000.0
         mock_sensor.temperature = 18.5
 
+        _BMP = "featherweather.sensors.barometric.barometric_reader.adafruit_bmp3xx.BMP3XX_I2C"  # noqa: E501
         with _make_i2c_patch():
-            with patch(
-                "featherweather.sensors.barometric.barometric_reader.adafruit_bmp3xx.BMP3XX_I2C",
-                return_value=mock_sensor,
-            ):
+            with patch(_BMP, return_value=mock_sensor):
                 reader = BarometricReader()
 
         payload = WeatherPayload()
@@ -169,11 +166,9 @@ class TestBarometricReader:
         mock_sensor.pressure = 985.0
         mock_sensor.temperature = 15.0
 
+        _BMP = "featherweather.sensors.barometric.barometric_reader.adafruit_bmp3xx.BMP3XX_I2C"  # noqa: E501
         with _make_i2c_patch():
-            with patch(
-                "featherweather.sensors.barometric.barometric_reader.adafruit_bmp3xx.BMP3XX_I2C",
-                return_value=mock_sensor,
-            ):
+            with patch(_BMP, return_value=mock_sensor):
                 reader = BarometricReader()
 
         gps = GpsData()
@@ -189,11 +184,9 @@ class TestBarometricReader:
         mock_sensor.pressure = 1000.0
         mock_sensor.temperature = 20.0
 
+        _BMP = "featherweather.sensors.barometric.barometric_reader.adafruit_bmp3xx.BMP3XX_I2C"  # noqa: E501
         with _make_i2c_patch():
-            with patch(
-                "featherweather.sensors.barometric.barometric_reader.adafruit_bmp3xx.BMP3XX_I2C",
-                return_value=mock_sensor,
-            ):
+            with patch(_BMP, return_value=mock_sensor):
                 reader = BarometricReader()
 
         payload = WeatherPayload()  # no gps
@@ -204,10 +197,9 @@ class TestBarometricReader:
         monkeypatch.setenv("BARO_ADDR", "0x76")
         captured = {}
 
+        _BMP = "featherweather.sensors.barometric.barometric_reader.adafruit_bmp3xx.BMP3XX_I2C"  # noqa: E501
         with _make_i2c_patch():
-            with patch(
-                "featherweather.sensors.barometric.barometric_reader.adafruit_bmp3xx.BMP3XX_I2C",
-            ) as mock_cls:
+            with patch(_BMP) as mock_cls:
                 mock_cls.return_value = MagicMock()
                 mock_cls.side_effect = (
                     lambda i2c, address: captured.update({"addr": address})
@@ -232,11 +224,9 @@ class TestTempHumidityReader:
         mock_sensor = MagicMock()
         mock_sensor.measurements = (23.1, 65.4)
 
+        _SHTC3 = "featherweather.sensors.temp_humidity.temp_humidity_reader.adafruit_shtc3.SHTC3"  # noqa: E501
         with _make_i2c_patch():
-            with patch(
-                "featherweather.sensors.temp_humidity.temp_humidity_reader.adafruit_shtc3.SHTC3",
-                return_value=mock_sensor,
-            ):
+            with patch(_SHTC3, return_value=mock_sensor):
                 reader = TempHumidityReader()
 
         payload = WeatherPayload()
@@ -250,11 +240,9 @@ class TestTempHumidityReader:
         mock_sensor = MagicMock()
         mock_sensor.measurements = (20.0, 50.0)
 
+        _SHTC3 = "featherweather.sensors.temp_humidity.temp_humidity_reader.adafruit_shtc3.SHTC3"  # noqa: E501
         with _make_i2c_patch():
-            with patch(
-                "featherweather.sensors.temp_humidity.temp_humidity_reader.adafruit_shtc3.SHTC3",
-                return_value=mock_sensor,
-            ):
+            with patch(_SHTC3, return_value=mock_sensor):
                 reader = TempHumidityReader()
 
         payload = WeatherPayload(ip_address="10.0.0.1")

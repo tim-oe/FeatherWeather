@@ -7,8 +7,6 @@ conftest.py.  Each test controls the mock's behaviour as needed.
 import sys
 from unittest.mock import MagicMock, call, patch
 
-import pytest
-
 from featherweather.display.neopixel_indicator import NeoPixelIndicator
 
 # ---------------------------------------------------------------------------
@@ -43,8 +41,6 @@ class TestNeoPixelIndicatorInit:
 
     def test_available_false_when_import_fails(self):
         """If neopixel raises on import, available should be False."""
-        import importlib
-
         # Temporarily replace the neopixel stub with one whose NeoPixel
         # constructor raises, simulating missing hardware.
         bad_neopixel = MagicMock()

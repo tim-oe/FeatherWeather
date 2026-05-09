@@ -21,15 +21,21 @@ Three transport modes are supported:
     Only relevant for boards with native USB (e.g. ESP32-S2 / S3).
     Not applicable to the Feather ESP32 V2.
 
+Lint and tests run automatically before a normal deploy and must pass.
+Pass --skip-tests to bypass both checks (e.g. for quick iteration).
+
+settings.toml is NOT deployed by default (it contains credentials).
+Pass --settings to explicitly upload it alongside the rest of the deploy.
+
 Usage:
     poetry run deploy
     python scripts/deploy.py
+    python scripts/deploy.py --settings             # also deploy settings.toml
     python scripts/deploy.py --skip-tests           # skip tests before deploy
     python scripts/deploy.py --diagnostic           # deploy diagnostic.py as code.py
-    python scripts/deploy.py --sysmon               # deploy sysmon.py as code.py
     python scripts/deploy.py --serial               # serial deploy via mpremote
+    python scripts/deploy.py --serial --settings    # serial + settings.toml
     python scripts/deploy.py --serial --diagnostic  # serial + diagnostic mode
-    python scripts/deploy.py --serial --sysmon      # serial + live monitor
     python scripts/deploy.py --serial --port /dev/ttyACM1  # non-default port
     python scripts/deploy.py --usb                  # USB drive deploy (ESP32-S2/S3)
     python scripts/deploy.py --usb-path /media/you/CIRCUITPY
@@ -52,24 +58,20 @@ SETTINGS_PATH = REPO_ROOT / "settings.toml"
 
 CODE_PY = REPO_ROOT / "code.py"
 DIAGNOSTIC_PY = REPO_ROOT / "diagnostic.py"
-SYSMON_PY = REPO_ROOT / "sysmon.py"
 BOOT_PY = REPO_ROOT / "boot.py"
 LIB_SRC = REPO_ROOT / "src" / "featherweather"
 
 
 def _resolve_source(mode: str) -> tuple[Path, str]:
-    """Return (source_file, label) for mode in {'normal', 'diagnostic', 'sysmon'}."""
+    """Return (source_file, label) for mode in {'normal', 'diagnostic'}."""
     if mode == "diagnostic":
         return DIAGNOSTIC_PY, "diagnostic.py (as code.py)"
-    if mode == "sysmon":
-        return SYSMON_PY, "sysmon.py (as code.py)"
     return CODE_PY, "code.py"
 
 
 def _mode_banner(mode: str) -> str:
     return {
         "diagnostic": "Mode: DIAGNOSTIC — device will run self-test on next boot",
-        "sysmon":     "Mode: SYSMON — device will stream live resource stats",
         "normal":     "",
     }.get(mode, "")
 
@@ -103,6 +105,19 @@ def load_settings() -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def run_lint() -> bool:
+    """Run the project linter. Returns True if all checks pass."""
+    print("=" * 60)
+    print("Running lint...")
+    print("=" * 60)
+    result = subprocess.run(["poetry", "run", "lint"])
+    if result.returncode == 0:
+        print("\nLint passed.\n")
+        return True
+    print("\nLint FAILED — aborting deploy.", file=sys.stderr)
+    return False
 
 
 def run_tests() -> bool:
@@ -164,7 +179,7 @@ def upload_file(host: str, remote_path: str, local_path: Path, auth: dict[str, s
 # ---------------------------------------------------------------------------
 
 
-def deploy_wifi(host: str, password: str, mode: str = "normal") -> int:
+def deploy_wifi(host: str, password: str, mode: str = "normal", deploy_settings: bool = False) -> int:
     auth = _auth_header(password)
 
     source_file, mode_label = _resolve_source(mode)
@@ -176,22 +191,36 @@ def deploy_wifi(host: str, password: str, mode: str = "normal") -> int:
         print(banner)
     print("=" * 60)
 
+    step = 1
+    total = 4 if deploy_settings else 3
+
     # 1. Upload boot.py
-    print("\n[1/3] Uploading boot.py ...")
+    print(f"\n[{step}/{total}] Uploading boot.py ...")
     if not BOOT_PY.exists():
         print(f"Error: {BOOT_PY} not found", file=sys.stderr)
         return 1
     upload_file(host, "boot.py", BOOT_PY, auth)
+    step += 1
 
-    # 2. Upload code.py (or diagnostic.py renamed to code.py)
-    print(f"\n[2/3] Uploading {mode_label} ...")
+    # 2. Upload settings.toml (optional)
+    if deploy_settings:
+        print(f"\n[{step}/{total}] Uploading settings.toml ...")
+        if not SETTINGS_PATH.exists():
+            print(f"Error: {SETTINGS_PATH} not found", file=sys.stderr)
+            return 1
+        upload_file(host, "settings.toml", SETTINGS_PATH, auth)
+        step += 1
+
+    # 3. Upload code.py (or diagnostic.py renamed to code.py)
+    print(f"\n[{step}/{total}] Uploading {mode_label} ...")
     if not source_file.exists():
         print(f"Error: {source_file} not found", file=sys.stderr)
         return 1
     upload_file(host, "code.py", source_file, auth)
+    step += 1
 
-    # 3. Upload the featherweather package to /lib/featherweather/
-    print("\n[3/3] Uploading featherweather package ...")
+    # 4. Upload the featherweather package to /lib/featherweather/
+    print(f"\n[{step}/{total}] Uploading featherweather package ...")
     if not LIB_SRC.exists():
         print(f"Error: {LIB_SRC} not found", file=sys.stderr)
         return 1
@@ -226,7 +255,7 @@ _DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
 
 
 
-def deploy_serial(port: str, mode: str = "normal") -> int:
+def deploy_serial(port: str, mode: str = "normal", deploy_settings: bool = False) -> int:
     source_file, mode_label = _resolve_source(mode)
     banner = _mode_banner(mode)
 
@@ -301,7 +330,10 @@ def deploy_serial(port: str, mode: str = "normal") -> int:
     # overwriting, since a deploy always implies something changed.
     chain: list[str] = ["mpremote", "connect", port, "+", "exec", mkdir_code]
 
-    if SETTINGS_PATH.exists():
+    if deploy_settings:
+        if not SETTINGS_PATH.exists():
+            print(f"Error: {SETTINGS_PATH} not found", file=sys.stderr)
+            return 1
         chain += ["+", "cp", "-f", str(SETTINGS_PATH), ":settings.toml"]
 
     chain += ["+", "cp", "-f", str(BOOT_PY), ":boot.py"]
@@ -341,7 +373,7 @@ def _find_circuitpy() -> Path | None:
     return None
 
 
-def deploy_usb(mount: Path | None, mode: str = "normal") -> int:
+def deploy_usb(mount: Path | None, mode: str = "normal", deploy_settings: bool = False) -> int:
     if mount is None:
         mount = _find_circuitpy()
 
@@ -371,24 +403,39 @@ def deploy_usb(mount: Path | None, mode: str = "normal") -> int:
         print(banner)
     print("=" * 60)
 
+    step = 1
+    total = 4 if deploy_settings else 3
+
     # 1. boot.py
-    print("\n[1/3] Copying boot.py ...")
+    print(f"\n[{step}/{total}] Copying boot.py ...")
     if not BOOT_PY.exists():
         print(f"Error: {BOOT_PY} not found", file=sys.stderr)
         return 1
     shutil.copy2(BOOT_PY, mount / "boot.py")
     print(f"  copied  boot.py → {mount / 'boot.py'}")
+    step += 1
 
-    # 2. code.py
-    print(f"\n[2/3] Copying {mode_label} ...")
+    # 2. settings.toml (optional)
+    if deploy_settings:
+        print(f"\n[{step}/{total}] Copying settings.toml ...")
+        if not SETTINGS_PATH.exists():
+            print(f"Error: {SETTINGS_PATH} not found", file=sys.stderr)
+            return 1
+        shutil.copy2(SETTINGS_PATH, mount / "settings.toml")
+        print(f"  copied  settings.toml → {mount / 'settings.toml'}")
+        step += 1
+
+    # 3. code.py
+    print(f"\n[{step}/{total}] Copying {mode_label} ...")
     if not source_file.exists():
         print(f"Error: {source_file} not found", file=sys.stderr)
         return 1
     shutil.copy2(source_file, mount / "code.py")
     print(f"  copied  {source_file.name} → {mount / 'code.py'}")
+    step += 1
 
-    # 3. featherweather package → lib/featherweather/
-    print("\n[3/3] Copying featherweather package ...")
+    # 4. featherweather package → lib/featherweather/
+    print(f"\n[{step}/{total}] Copying featherweather package ...")
     if not LIB_SRC.exists():
         print(f"Error: {LIB_SRC} not found", file=sys.stderr)
         return 1
@@ -417,16 +464,15 @@ def main() -> int:
         action="store_true",
         help="Deploy without running tests first",
     )
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument(
+    parser.add_argument(
+        "--settings",
+        action="store_true",
+        help="Also deploy settings.toml to the device (contains credentials — opt-in only)",
+    )
+    parser.add_argument(
         "--diagnostic",
         action="store_true",
         help="Deploy diagnostic.py as code.py (device runs self-test on next boot)",
-    )
-    mode_group.add_argument(
-        "--sysmon",
-        action="store_true",
-        help="Deploy sysmon.py as code.py (live htop-style resource monitor)",
     )
     parser.add_argument(
         "--serial",
@@ -457,28 +503,25 @@ def main() -> int:
     use_serial = args.serial
     use_usb = args.usb or bool(args.usb_path)
 
-    if args.diagnostic:
-        mode = "diagnostic"
-    elif args.sysmon:
-        mode = "sysmon"
-    else:
-        mode = "normal"
+    mode = "diagnostic" if args.diagnostic else "normal"
 
-    # Tests only matter for normal-mode code.py deploys; diagnostic and sysmon
-    # are debug payloads where running the test suite first is just friction.
+    # Lint + tests only matter for normal-mode code.py deploys; diagnostic is a
+    # debug payload where running checks first is just friction.
     if not args.skip_tests and mode == "normal":
+        if not run_lint():
+            return 1
         if not run_tests():
             return 1
 
     if use_serial:
-        return deploy_serial(args.port, mode=mode)
+        return deploy_serial(args.port, mode=mode, deploy_settings=args.settings)
 
     if use_usb:
         mount = Path(args.usb_path) if args.usb_path else None
-        return deploy_usb(mount, mode=mode)
+        return deploy_usb(mount, mode=mode, deploy_settings=args.settings)
 
     host, password = load_settings()
-    return deploy_wifi(host, password, mode=mode)
+    return deploy_wifi(host, password, mode=mode, deploy_settings=args.settings)
 
 
 if __name__ == "__main__":

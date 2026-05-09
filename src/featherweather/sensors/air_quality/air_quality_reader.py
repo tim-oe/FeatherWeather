@@ -4,7 +4,7 @@ No Adafruit library exists for this sensor — uses raw I2C via adafruit_bus_dev
 Implements CRC validation and retry logic from WeatherWatch.
 
 IMPORTANT: The HM3301 requires I2C bus speed <= 20 kHz.  Set the ``I2C_FREQ_HZ``
-environment variable to 20000 (the default when using ``featherweather.hardware.i2c_bus``).
+environment variable to 20000 (the default for ``featherweather.hardware.i2c_bus``).
 
 Ported from https://github.com/tim-oe/WeatherWatch
 Reference: https://wiki.seeedstudio.com/Grove-Laser_PM2.5_Sensor-HM3301/
@@ -110,7 +110,8 @@ class AirQualityReader(I2cSensorBase):
 
             if data.is_high(_CEILING) and attempt < self._retry - 1:
                 print(
-                    f"AirQuality out-of-range (attempt {attempt + 1}/{self._retry}), retrying..."
+                    f"AirQuality out-of-range "
+                    f"(attempt {attempt + 1}/{self._retry}), retrying..."
                 )
                 retry_data = self._read_one(buf)
                 if retry_data is not None:

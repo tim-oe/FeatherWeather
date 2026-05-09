@@ -163,6 +163,7 @@ class DisplayController:
             self._p_wind,
             self._p_rain_light,
             self._p_sound,
+            self._p_system,
         ]
 
     # ------------------------------------------------------------------
@@ -398,6 +399,38 @@ class DisplayController:
             "SOUND LEVEL",
             f"dB SPL: {_fmt(db, '{:.1f} dB')}",
             f"Level:  {qual}",
+        )
+
+    def _p_system(self) -> None:
+        sys = self.payload.system
+        used_b = _safe(sys, "heap_used_b")
+        free_b = _safe(sys, "heap_free_b")
+        pct = _fmt(_safe(sys, "heap_pct"), "{}%", "---")
+        used_str = f"{used_b // 1024} KB" if used_b is not None else "---"
+        free_str = f"{free_b // 1024} KB" if free_b is not None else "---"
+
+        uptime = _safe(sys, "uptime_s")
+        if uptime is None:
+            up_str = "---"
+        elif uptime < 3600:
+            up_str = f"{int(uptime)}s"
+        else:
+            up_str = f"{int(uptime / 3600)}h {int((uptime % 3600) / 60)}m"
+
+        cpu_mhz = _safe(sys, "cpu_freq_mhz")
+        cpu_str = f"{cpu_mhz} MHz" if cpu_mhz is not None else "---"
+
+        try:
+            fw = os.uname().release
+        except Exception:  # noqa: BLE001
+            fw = "---"
+
+        self._draw(
+            "SYSTEM",
+            f"Used:  {used_str} ({pct})",
+            f"Free:  {free_str}",
+            f"CPU:   {cpu_str}  FW:{fw}",
+            f"Up:    {up_str}",
         )
 
     # ------------------------------------------------------------------

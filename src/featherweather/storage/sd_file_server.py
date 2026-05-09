@@ -23,7 +23,6 @@ import json
 import os
 
 import socketpool
-import wifi
 
 __all__ = ["SdFileServer"]
 
@@ -56,7 +55,7 @@ class SdFileServer:
 
     @staticmethod
     def _check_sd() -> None:
-        """Verify /sd is mounted and log what's there — same logic as diagnostic._verify_sd."""
+        """Verify /sd is mounted and log what's there."""
         try:
             entries = os.listdir(_SD_ROOT)
             print(f"[sd-server] /sd OK — {len(entries)} file(s): {entries}")

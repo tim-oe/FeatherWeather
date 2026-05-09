@@ -15,7 +15,9 @@ Usage:
     pool = socketpool.SocketPool(wifi.radio)
     client = MqttClient(pool)
     client.connect()
-    client.publish(WeatherPayload(baro, temp_hum, aq, rain, wind_dir, wind_spd, illum, gps))
+    client.publish(
+        WeatherPayload(baro, temp_hum, aq, rain, wind_dir, wind_spd, illum, gps)
+    )
     client.disconnect()
 """
 
