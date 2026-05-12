@@ -26,3 +26,24 @@ RS485_BAUD = 9600
 
 # RS485 Modbus read timeout in seconds (as integer milliseconds for TOML compat)
 RS485_TIMEOUT_MS = 500
+
+# If Modbus times out with 0 bytes on auto-direction TTL boards, add extra delay (ms).
+# RS485_TURNAROUND_MS = 40
+
+# Required for common TTL RS485 boards that only expose V/G/TX/RX (auto direction).
+# When true, GPIO D12 is not touched — important on ESP32 (D12/GPIO12 is a strapping pin).
+# Set false only if DE/~RE from the transceiver is wired to D12.
+RS485_AUTO_DIRECTION = true
+
+# Optional: extra ms when Modbus slave address changes (wind vane -> wind speed).
+# Default in firmware is 80 if unset. Set 0 only if you need fastest polling.
+# RS485_SLAVE_SWITCH_MS = 120
+
+# Optional: pause before each Modbus request (ms). Helps some slaves after rapid reads.
+# RS485_INTER_REQUEST_MS = 40
+
+# Optional: UART pin swap vs A0=TX / A1=RX (full power-cycle after change).
+# RS485_UART_SWAP = true
+
+# Optional: larger UART RX ring for auto-direction adapters (default 256; 0 = omit).
+# RS485_RX_BUFFER = 512

@@ -68,6 +68,33 @@ The breakout has six through-holes. Suggested cable colors:
 >
 > **D13 / "led" pin note:** The pinout PDF labels this pin **led** (primary) with GPIO13 as the secondary label. In CircuitPython it is `board.D13` (also `board.LED`). It is the fourth signal pin on the top row: BAT → EN → USB → **led/GPIO13** → 12 → 27 → 33 → 15 → 32 → 14 → SCL → SDA. The red LED is driven by this pin — it will mirror the LRCL signal while audio is running, which is harmless.
 
+### SEN0575 Rain Gauge wiring (STEMMA QT ↔ DFRobot Gravity JST)
+
+The DFRobot SEN0575 board ships with a 4-pin JST-PH "Gravity" connector whose
+**power/ground colors are inverted** from the standard Adafruit STEMMA QT
+convention. The on-board silkscreen labels the JST pins `V G D C` (VCC, GND,
+SDA, SCL), but the matching DFRobot pigtail uses **black for V** and **red
+for G** — the opposite of what STEMMA QT cables do. To bridge a STEMMA QT
+cable from the Feather to the DFRobot JST, swap the red/black wires:
+
+| STEMMA QT (Feather end) | DFRobot JST (sensor end) | Signal |
+|-------------------------|--------------------------|--------|
+| red                     | **black** (V)            | 3.3 V  |
+| black                   | **red**   (G)            | GND    |
+| blue                    | green     (D)            | SDA    |
+| yellow                  | white     (C)            | SCL    |
+
+> **Double-check before powering on.** Reversing 3V3/GND on the SEN0575 will
+> damage the on-board MCU. The wire colors above are correct only if your
+> DFRobot pigtail follows the V=black / G=red convention printed on this
+> particular SEN0575 board — verify with a multimeter (continuity from the JST
+> pin under the `V` silkscreen back to the cable conductor) before plugging
+> into the Feather.
+
+Set the SEN0575 DIP switch to **I2C** (not UART) before connecting; the sensor
+appears at I2C address `0x1D` and is verified by `diagnostic.py` and read on
+every cycle by `code.py`.
+
 ### Hardware Notes
 
 - **GPS FeatherWing**: requires UART — works with ESP32 Feather V2. Does not work with Feather 328p, ESP8266, or nRF52832.
@@ -80,7 +107,7 @@ The breakout has six through-holes. Suggested cable colors:
 - **RS485 sensors (SEN0482/0483/0644)**: All share one RS485 bus via MAX3485 TTL module. Wired to a dedicated `busio.UART` on A0/A1 + `D12` (GPIO12) for DE/~RE direction control. D12 is a strapping pin (must be LOW at power-on) but is safe here because DE defaults LOW (receive mode) in the driver. A0 and A1 are at the far end of the 16-pin bottom row; D12 is at the far end of the 12-pin top row — directly across the board, the closest available output-capable pin. **SEN0482 and SEN0483 both default to Modbus address 0x02** — use `reader.set_address()` with each sensor connected alone to resolve the conflict before deploying on the shared bus.
 - **OLED FeatherWing #4650**: SH1107 128×64 monochrome display on the shared I2C bus at address `0x3C`. Three buttons are stacked vertically on the wing — TOP (C) advances to the next page, MIDDLE (B) forces a redraw, BOTTOM (A) goes back. Board pins are `A8`/`A7`/`A6` (GPIO15/32/37) on the Feather ESP32 V2 — the FeatherWing PCB labels them "5"/"6"/"9" but those Feather header positions map to different GPIO names on ESP32 than on SAMD/RP2040. The display is refreshed automatically after each sensor cycle.
 - **I2S MEMS Microphone #3421**: SPH0645LM4H-LB on a 6-pin breakout. **Not supported in the stock CircuitPython 10.2.0 ESP32 firmware**, but support is imminent: [PR #10990](https://github.com/adafruit/circuitpython/pull/10990) (opened May 8 2026, by a CircuitPython collaborator) adds a new `audio_i2sin.I2SIn` class for both Espressif and RP2040 ports and was tested on an ESP32 Huzzah Feather. To use the mic now, flash a **nightly/dev build** from [circuitpython.org/board/adafruit_feather_esp32_v2](https://circuitpython.org/board/adafruit_feather_esp32_v2/) once PR #10990 is merged. Until then, `MicrophoneReader` raises `NotImplementedError` at import time and is silently skipped by `code.py`; the SOUND LEVEL display page shows `---`. Pins: `D27` (BCLK, GPIO27), `D13` (LRCL/WS, GPIO13 — labeled **led** in the pinout PDF, also drives the red LED, harmless during audio), `A2` (DOUT, GPIO34 input-only). `SEL` is bridged to `GND` on the breakout PCB (left channel) — the Feather has only one GND header pin so both grounds are satisfied at the breakout side.
-- **SEN0575**: Set DIP switch to I2C position before use. Fixed address `0x1D`. No official CircuitPython library — uses a ported raw I2C driver. Provides cumulative rainfall (mm), raw tip count, and uptime. Rolling 1-24 hour window available via `read_window(hours)`.
+- **SEN0575**: Set DIP switch to I2C position before use. Fixed address `0x1D`. No official CircuitPython library — uses a ported raw I2C driver. Provides cumulative rainfall (mm), raw tip count, and uptime. Rolling 1-24 hour window available via `read_window(hours)`. **Wire colors are inverted** on the DFRobot JST (V=black, G=red) — see [SEN0575 Rain Gauge wiring](#sen0575-rain-gauge-wiring-stemma-qt--dfrobot-gravity-jst) for the STEMMA-QT↔Gravity mapping.
 - **I2C address map**: SEN0575 `0x1D`, HM3301 `0x40`, OLED SH1107 `0x3C`, PCF8523 `0x68`, SHTC3 `0x70`, BMP390 `0x77` — no conflicts.
 - **Power**: USB-C or LiPoly battery with built-in charging on the Feather V2.
 

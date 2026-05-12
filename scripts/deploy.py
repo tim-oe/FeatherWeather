@@ -33,9 +33,11 @@ Usage:
     python scripts/deploy.py --settings             # also deploy settings.toml
     python scripts/deploy.py --skip-tests           # skip tests before deploy
     python scripts/deploy.py --diagnostic           # deploy diagnostic.py as code.py
+    python scripts/deploy.py --rs485-diag           # deploy rs485_diag.py as code.py
     python scripts/deploy.py --serial               # serial deploy via mpremote
     python scripts/deploy.py --serial --settings    # serial + settings.toml
     python scripts/deploy.py --serial --diagnostic  # serial + diagnostic mode
+    python scripts/deploy.py --serial --rs485-diag  # serial + RS485 diagnostic
     python scripts/deploy.py --serial --port /dev/ttyACM1  # non-default port
     python scripts/deploy.py --usb                  # USB drive deploy (ESP32-S2/S3)
     python scripts/deploy.py --usb-path /media/you/CIRCUITPY
@@ -58,20 +60,24 @@ SETTINGS_PATH = REPO_ROOT / "settings.toml"
 
 CODE_PY = REPO_ROOT / "code.py"
 DIAGNOSTIC_PY = REPO_ROOT / "diagnostic.py"
+RS485_DIAG_PY = REPO_ROOT / "rs485_diag.py"
 BOOT_PY = REPO_ROOT / "boot.py"
 LIB_SRC = REPO_ROOT / "src" / "featherweather"
 
 
 def _resolve_source(mode: str) -> tuple[Path, str]:
-    """Return (source_file, label) for mode in {'normal', 'diagnostic'}."""
+    """Return (source_file, label) for mode in {'normal', 'diagnostic', 'rs485_diag'}."""
     if mode == "diagnostic":
         return DIAGNOSTIC_PY, "diagnostic.py (as code.py)"
+    if mode == "rs485_diag":
+        return RS485_DIAG_PY, "rs485_diag.py (as code.py)"
     return CODE_PY, "code.py"
 
 
 def _mode_banner(mode: str) -> str:
     return {
         "diagnostic": "Mode: DIAGNOSTIC — device will run self-test on next boot",
+        "rs485_diag": "Mode: RS485_DIAG — device will run RS485/Modbus line test on boot",
         "normal":     "",
     }.get(mode, "")
 
@@ -475,6 +481,11 @@ def main() -> int:
         help="Deploy diagnostic.py as code.py (device runs self-test on next boot)",
     )
     parser.add_argument(
+        "--rs485-diag",
+        action="store_true",
+        help="Deploy rs485_diag.py as code.py (RS485/Modbus bus diagnostic only)",
+    )
+    parser.add_argument(
         "--serial",
         action="store_true",
         help=(
@@ -503,10 +514,18 @@ def main() -> int:
     use_serial = args.serial
     use_usb = args.usb or bool(args.usb_path)
 
-    mode = "diagnostic" if args.diagnostic else "normal"
+    if args.diagnostic and args.rs485_diag:
+        print("Error: use only one of --diagnostic or --rs485-diag", file=sys.stderr)
+        return 1
+    if args.diagnostic:
+        mode = "diagnostic"
+    elif args.rs485_diag:
+        mode = "rs485_diag"
+    else:
+        mode = "normal"
 
-    # Lint + tests only matter for normal-mode code.py deploys; diagnostic is a
-    # debug payload where running checks first is just friction.
+    # Lint + tests only matter for normal-mode code.py deploys; diagnostic /
+    # rs485_diag are debug payloads where running checks first is friction.
     if not args.skip_tests and mode == "normal":
         if not run_lint():
             return 1

@@ -12,6 +12,7 @@ Hardware checked
     BMP390       barometric pressure + temperature  I2C 0x77
     HM3301       PM air quality                     I2C 0x40  (bus <= 20 kHz)
     SHTC3        temperature / humidity             I2C 0x70
+    SEN0575      tipping bucket rainfall            I2C 0x1D  (DIP → I2C mode)
     PCF8523      Adalogger FeatherWing RTC          I2C 0x68
     SH1107       OLED FeatherWing #4650 128×64      I2C 0x3C
     SPH0645      I2S MEMS microphone #3421          I2S (D27/D13/A2)
@@ -452,6 +453,25 @@ def _check_hm3301():
         return None
 
 
+def _check_sen0575():
+    _section("SEN0575 Tipping Bucket Rainfall Sensor")
+    _log("  DIP switch must be set to I2C mode (not UART).")
+    try:
+        data = RainfallReader.verify()
+        _result(
+            "SEN0575",
+            True,
+            f"cumulative={data.cumulative_rainfall_mm:.2f} mm"
+            f"  tips={data.bucket_count}"
+            f"  uptime={data.working_time_h:.1f} h"
+            f"  1h={data.rainfall_window_mm:.2f} mm",
+        )
+        return data
+    except Exception as exc:  # noqa: BLE001
+        _result("SEN0575", False, str(exc))
+        return None
+
+
 def _check_mic():
     _section("SPH0645 I2S MEMS Microphone #3421")
     _log("  [SKIP] audio_i2sin not in stock 10.2.0 — awaiting PR #10990")
@@ -634,6 +654,9 @@ _track(th_data is not None)
 aq_data = _check_hm3301()
 _track(aq_data is not None)
 
+rain_data = _check_sen0575()
+_track(rain_data is not None)
+
 mic_data = _check_mic()
 # Not tracked — skipped until audio_i2sin firmware support lands
 
@@ -659,6 +682,7 @@ _result("SH1107 OLED",         oled_ok)
 _result("BMP390 Barometric",   baro_data is not None)
 _result("SHTC3 Temp/Humidity", th_data is not None)
 _result("HM3301 Air Quality",  aq_data is not None)
+_result("SEN0575 Rainfall",    rain_data is not None)
 
 _log("[SKIP] SPH0645 Microphone — awaiting audio_i2sin (PR #10990)")
 

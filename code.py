@@ -19,10 +19,24 @@ Pin assignments (adjust to match your wiring):
     SPI  CS                board.D33               (SD chip-select; mounted at /sd)
     UART1 TX / RX          board.TX / board.RX     (GPS FeatherWing, 9600 baud)
     UART2 TX / RX          board.A0 / board.A1     (RS485 MAX3485, 9600 baud)
-    DE   MAX3485 DE/~RE    board.D12  (GPIO12 — strapping pin, LOW at boot; safe default)
+    DE   MAX3485 DE/~RE    board.D12  (omit if RS485_AUTO_DIRECTION — 4-pin TTL)
     OLED TOP    (C)        board.A6                (GPIO37, input-only — next page)
     OLED MIDDLE (B)        board.A7                (GPIO32 — toggle display on/off)
     OLED BOTTOM (A)        board.A8                (GPIO15 — previous page)
+
+RS485 / safe mode (hard fault before code.py runs):
+    If the board only boots after you unplug the RS485 adapter, the failure is
+    almost always electrical — CircuitPython is not running your script yet.
+
+    - TTL levels: ESP32 GPIO are not 5 V tolerant. Power the adapter from 3.3 V
+      if it supports it, or use a 3.3 V logic / level-shifted module so RO/TX
+      never drives A1 above ~3.6 V. A 5 V idle UART line into RX can brown out
+      or fault the chip at boot.
+    - Use the TTL side only (DI/RO or TX/RX labels), never the RS485 A/B pair,
+      on Feather A0/A1.
+    - For 4-pin auto-direction boards set RS485_AUTO_DIRECTION = true so D12 is
+      not used. Do not tie the adapter to D12 (GPIO12): it is an ESP32 strapping
+      pin; being pulled high at reset can prevent a normal boot.
 
 Modbus addresses (reprogram conflicting sensors before first use):
     SEN0482 Wind Direction  0x02  (default)
@@ -34,6 +48,12 @@ Environment variables (settings.toml):
     GPS_BAUD                GPS UART baud rate                (default 9600)
     RS485_BAUD              RS485 UART baud rate              (default 9600)
     RS485_TIMEOUT_MS        RS485 read timeout                (default 500)
+    RS485_TURNAROUND_MS     extra ms after TX (auto RS485; try 20–50 if timeouts)
+    RS485_INTER_REQUEST_MS  ms pause before each Modbus frame (0 default; try 40)
+    RS485_SLAVE_SWITCH_MS   extra ms when slave addr changes (default 80; 0=off)
+    RS485_AUTO_DIRECTION    1/true for 4-pin TTL RS485 (no D12 DE/~RE)
+    RS485_UART_SWAP         1/true to swap UART pins (TX=A1, RX=A0)
+    RS485_RX_BUFFER         UART RX buffer size (default 256; 0 = library default)
     I2C_FREQ_HZ             I2C bus frequency                 (default 20000)
     NTP_TIMEZONE / NTP_TIMEZONE_OFFSET  local timezone        (default UTC)
     WIND_DIR_ADDR           SEN0482 Modbus address            (default 0x02)

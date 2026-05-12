@@ -7,6 +7,20 @@ Source: https://github.com/DFRobot/DFRobot_RainfallSensor
 
 IMPORTANT: Set the DIP switch on the sensor board to the I2C position before use.
 
+WIRING (STEMMA QT ↔ DFRobot Gravity JST):
+    The DFRobot pigtail uses **V=black, G=red** (inverted from STEMMA QT).
+    When bridging a STEMMA QT cable to the SEN0575's JST, swap red and black:
+
+        STEMMA QT            DFRobot JST (silkscreen)
+        ---------            ------------------------
+        red    (3V3)   <-->  black  (V)
+        black  (GND)   <-->  red    (G)
+        blue   (SDA)   <-->  green  (D)
+        yellow (SCL)   <-->  white  (C)
+
+    Verify with a multimeter before powering on — reversing 3V3/GND will
+    damage the sensor's on-board MCU.
+
 Environment variable:
     RAIN_ADDR  I2C address override, hex or decimal (default 0x1D)
 
