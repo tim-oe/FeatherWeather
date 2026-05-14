@@ -2,6 +2,9 @@
 
 ESP32-based weather station with GPS timestamping, battery-backed RTC, and SD card logging.
 
+
+![ESP32 Board](docs/img/esp32-board.jpg)
+
 ## Hardware
 
 ### Feather Stack
