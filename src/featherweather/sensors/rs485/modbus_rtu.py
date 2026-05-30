@@ -1,12 +1,13 @@
-"""Minimal Modbus RTU master for CircuitPython over UART + MAX3485.
+"""Minimal Modbus RTU master for CircuitPython over UART.
 
 Supports Function Code 0x03 (Read Holding Registers) and
 Function Code 0x06 (Write Single Register) — sufficient for all
 DFRobot RS485 weather sensors.
 
-The MAX3485 is half-duplex. A single GPIO (de_pin) controls the direction:
-    HIGH → transmit (Driver Enable)
-    LOW  → receive  (Receiver Enable via /RE tied to DE)
+RS485 adapter: DFRobot DFR0845 (active isolated, auto-direction).
+When de_pin is None (RS485_AUTO_DIRECTION = true) the adapter handles
+TX/RX switching internally. When de_pin is set, it is driven HIGH to
+transmit and LOW to receive (for manual DE/~RE adapters).
 """
 
 import os
@@ -64,12 +65,12 @@ def _record_modbus_slave(slave_addr: int) -> None:
 
 
 class ModbusRtu:
-    """Half-duplex Modbus RTU master for RS485 sensors via MAX3485.
+    """Half-duplex Modbus RTU master for RS485 sensors.
 
     Args:
         uart:     busio.UART configured at 9600 8N1 (timeout >= 0.5 s)
-        de_pin:   digitalio.DigitalInOut driving MAX3485 DE / ~RE, or ``None``
-                  for auto-direction TTL adapters (no DE GPIO).
+        de_pin:   digitalio.DigitalInOut driving DE / ~RE, or ``None``
+                  for auto-direction adapters like the DFR0845 (no DE GPIO).
         timeout:  read timeout in seconds (default 0.5)
     """
 

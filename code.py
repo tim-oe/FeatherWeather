@@ -18,8 +18,8 @@ Pin assignments (adjust to match your wiring):
     SPI  SCK / MOSI / MISO board.SCK / MOSI / MISO (SD card on Adalogger)
     SPI  CS                board.D33               (SD chip-select; mounted at /sd)
     UART1 TX / RX          board.TX / board.RX     (GPS FeatherWing, 9600 baud)
-    UART2 TX / RX          board.A0 / board.A1     (RS485 MAX3485, 9600 baud)
-    DE   MAX3485 DE/~RE    board.D12  (omit if RS485_AUTO_DIRECTION — 4-pin TTL)
+    UART2 TX / RX          board.A0 / board.A1     (RS485 DFR0845, 9600 baud)
+    DFR0845 VCC            USB (5V VBUS)            (not 3V — internal boost overloads LDO)
     OLED TOP    (C)        board.A6                (GPIO37, input-only — next page)
     OLED MIDDLE (B)        board.A7                (GPIO32 — toggle display on/off)
     OLED BOTTOM (A)        board.A8                (GPIO15 — previous page)
@@ -28,15 +28,15 @@ RS485 / safe mode (hard fault before code.py runs):
     If the board only boots after you unplug the RS485 adapter, the failure is
     almost always electrical — CircuitPython is not running your script yet.
 
-    - TTL levels: ESP32 GPIO are not 5 V tolerant. Power the adapter from 3.3 V
-      if it supports it, or use a 3.3 V logic / level-shifted module so RO/TX
-      never drives A1 above ~3.6 V. A 5 V idle UART line into RX can brown out
-      or fault the chip at boot.
-    - Use the TTL side only (DI/RO or TX/RX labels), never the RS485 A/B pair,
-      on Feather A0/A1.
-    - For 4-pin auto-direction boards set RS485_AUTO_DIRECTION = true so D12 is
-      not used. Do not tie the adapter to D12 (GPIO12): it is an ESP32 strapping
-      pin; being pulled high at reset can prevent a normal boot.
+    - Power: the DFR0845's internal boost converter draws enough current to
+      brownout the AP2112K LDO — power the adapter VCC (+) from the Feather
+      USB pin (5V VBUS), not the 3V pin.
+    - Signal levels: DFR0845 UART side is 3.3V/5V compatible; ESP32 A0/A1
+      are 3.3V logic and safe with this adapter.
+    - RS485_AUTO_DIRECTION = true is required (DFR0845 has no DE/~RE pin).
+      D12 (GPIO12) must not be connected — it is an ESP32 strapping pin.
+    - External 12V supply on DFR0845 12V-IN backfeeds through the adapter
+      even when the supply is off; power the 12V supply on before USB.
 
 Modbus addresses (reprogram conflicting sensors before first use):
     SEN0482 Wind Direction  0x02  (default)

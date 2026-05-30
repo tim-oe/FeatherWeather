@@ -13,6 +13,8 @@ Environment variable:
 Usage:
     reader = WindSpeedReader()
     reader.read(payload)           # populates payload.wind_speed
+    # or for diagnostics:
+    data = WindSpeedReader.verify()
 """
 
 from featherweather.sensors.rs485.rs485_sensor_base import Rs485SensorBase
@@ -52,6 +54,19 @@ class WindSpeedReader(Rs485SensorBase):
         data.beaufort = beaufort_description(data.speed_ms)
         print(data)
         payload.wind_speed = data
+
+    @classmethod
+    def verify(cls) -> "WindSpeedData":
+        """Instantiate, take one reading, and return the WindSpeedData.
+
+        Raises on any hardware or communication failure.
+        """
+        from featherweather.storage.weather_payload import WeatherPayload  # noqa: PLC0415
+
+        sensor = cls()
+        payload = WeatherPayload()
+        sensor.read(payload)
+        return payload.wind_speed
 
     def set_address(self, new_address: int) -> None:
         """Reassign the Modbus slave address (persisted in sensor flash)."""

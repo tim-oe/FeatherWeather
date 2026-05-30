@@ -1,12 +1,13 @@
 """Shared RS485 UART + DE-pin singleton for FeatherWeather.
 
-The MAX3485 transceiver is half-duplex; all RS485 Modbus sensors share
-one busio.UART and one direction-control GPIO.
+The DFRobot DFR0845 Active Isolated RS485-to-UART adapter handles direction
+switching internally (auto-direction). All RS485 Modbus sensors share one
+busio.UART; no DE/~RE GPIO is required when RS485_AUTO_DIRECTION is true.
 
 Pin assignments (default; see RS485_UART_SWAP):
     UART TX   board.A0  (GPIO26)  — or A1 when RS485_UART_SWAP is true
     UART RX   board.A1  (GPIO25)  — or A0 when RS485_UART_SWAP is true
-    DE / ~RE  board.D12 (GPIO12 — LOW at boot via strapping, safe default)
+    DE / ~RE  board.D12 (GPIO12)  — only used when RS485_AUTO_DIRECTION is false
 
 Environment variables:
     RS485_BAUD             baud rate in bps     (default 9600)

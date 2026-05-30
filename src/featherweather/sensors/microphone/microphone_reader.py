@@ -1,8 +1,13 @@
 """I2S MEMS microphone reader for CircuitPython (Adafruit #3421, SPH0645LM4H-LB).
 
-The SPH0645 is a 24-bit I2S microphone (18-bit precision).  Reads via the new
-`audio_i2sin` module (CircuitPython PR #10990, merged after 10.2.0) which adds
-`audio_i2sin.I2SIn` for Espressif and RP2040 ports.
+The SPH0645 is a 24-bit I2S microphone (18-bit precision).  Reads via the
+`audioi2sin` module (CircuitPython PR #10990) which adds `audioi2sin.I2SIn`
+for Espressif and RP2040 ports.
+
+PR status (as of 2026-05-29): open, under final review — not yet in any stable
+release. The module name was confirmed as `audioi2sin` (no underscore) in the
+PR. Flash a nightly build once merged:
+    https://circuitpython.org/board/adafruit_feather_esp32_v2/
 
 Sensitivity (from datasheet):
     −26 dBFS at 94 dB SPL, 1 kHz sine.
@@ -21,14 +26,13 @@ Usage:
     print(data.db_spl)   # e.g. 58.3
 
 Firmware requirement:
-    Requires a CircuitPython build that includes the `audio_i2sin` module
-    (added in PR #10990 — not in the 10.2.0 release).
-    Download a dev/nightly build from
-    https://circuitpython.org/board/adafruit_feather_esp32_v2/
-    Once merged and released, `audio_i2sin` will be available in a stable build.
+    Requires a CircuitPython build that includes `audioi2sin` (PR #10990).
+    Not available in stable releases as of 10.2.1. Flash a nightly build from
+    https://circuitpython.org/board/adafruit_feather_esp32_v2/ once the PR
+    merges into main.
 
-    If the module is absent (e.g. stock 10.2.0), construction raises
-    NotImplementedError and code.py silently skips the mic via _try_init().
+    If the module is absent, construction raises NotImplementedError and
+    code.py silently skips the mic via _try_init().
 """
 
 import array
@@ -109,7 +113,8 @@ class MicrophoneReader(SensorBase):
     ) -> None:
         if _I2SIn is None:
             raise NotImplementedError(
-                "audio_i2sin not available in this CircuitPython build (stock 10.2.0). "
+                "audioi2sin not available in this CircuitPython build. "
+                "PR #10990 is still open (last updated 2026-05-29) — not in stable 10.2.1. "
                 "Flash a nightly build from circuitpython.org once PR #10990 merges."
             )
         if bclk_pin is None:

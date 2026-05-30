@@ -13,6 +13,8 @@ Environment variable:
 Usage:
     reader = IlluminanceReader()
     reader.read(payload)           # populates payload.illuminance
+    # or for diagnostics:
+    data = IlluminanceReader.verify()
 """
 
 from featherweather.sensors.illuminance.illuminance_data import IlluminanceData
@@ -52,6 +54,19 @@ class IlluminanceReader(Rs485SensorBase):
         data.lux = raw / _LUX_SCALE
         print(data)
         payload.illuminance = data
+
+    @classmethod
+    def verify(cls) -> "IlluminanceData":
+        """Instantiate, take one reading, and return the IlluminanceData.
+
+        Raises on any hardware or communication failure.
+        """
+        from featherweather.storage.weather_payload import WeatherPayload  # noqa: PLC0415
+
+        sensor = cls()
+        payload = WeatherPayload()
+        sensor.read(payload)
+        return payload.illuminance
 
     def set_address(self, new_address: int) -> None:
         """Reassign the Modbus slave address (persisted in sensor flash)."""

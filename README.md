@@ -43,9 +43,8 @@ ESP32-based weather station with GPS timestamping, battery-backed RTC, and SD ca
 | GPS FeatherWing | RX → TX | 8 |
 | Built-in NeoPixel | Data | 0 |
 | BMP390 + SHTC3 | SDA/SCL | STEMMA QT |
-| RS485 MAX3485 | UART TX | A0 |
-| RS485 MAX3485 | UART RX | A1 |
-| RS485 MAX3485 | DE/~RE | D12 (GPIO12) |
+| RS485 DFR0845 | UART TX (→ module R) | A0 |
+| RS485 DFR0845 | UART RX (← module T) | A1 |
 | OLED FeatherWing #4650 | Button C — TOP (next page →) | A8 (GPIO15) |
 | OLED FeatherWing #4650 | Button B — MIDDLE (force redraw) | A7 (GPIO32) |
 | OLED FeatherWing #4650 | Button A — BOTTOM (← prev page) | A6 (GPIO37, input-only) |
@@ -70,6 +69,44 @@ The breakout has six through-holes. Suggested cable colors:
 > **GND / SEL note:** The Feather V2 exposes only one GND header pin. Rather than running two ground wires to the board, solder a short wire directly between the `SEL` and `GND` through-holes on the mic breakout. This selects left-channel output and leaves only five wires running to the Feather. Tie `SEL` to `3V` on the breakout instead if you want right-channel output.
 >
 > **D13 / "led" pin note:** The pinout PDF labels this pin **led** (primary) with GPIO13 as the secondary label. In CircuitPython it is `board.D13` (also `board.LED`). It is the fourth signal pin on the top row: BAT → EN → USB → **led/GPIO13** → 12 → 27 → 33 → 15 → 32 → 14 → SCL → SDA. The red LED is driven by this pin — it will mirror the LRCL signal while audio is running, which is harmless.
+
+### DFR0845 RS485 Adapter wiring
+
+The [DFRobot DFR0845](https://www.dfrobot.com/product-2392.html) replaces the MAX3485. It provides galvanic isolation (3000 VDC), auto-direction control, and an isolated 12V power output for the RS485 sensors. No DE/~RE pin is used.
+
+**Gravity UART connector → ESP32 Feather V2**
+
+| DFR0845 pin | Signal | ESP32 pin |
+|-------------|--------|-----------|
+| `+` (VCC) | 5V power | **USB** (VBUS, 5V) ⚠ see note |
+| `-` (GND) | Ground | **GND** |
+| `T` (module TX out) | RS485 → MCU | **A1** (UART RX, GPIO25) |
+| `R` (module RX in) | MCU → RS485 | **A0** (UART TX, GPIO26) |
+
+> `T` connects to `A1` and `R` connects to `A0` — the labels are from the module's perspective, so they cross-connect to the ESP32's RX/TX.
+
+> **⚠ Power the DFR0845 from the `USB` pin (5V VBUS), not `3V`.** The module's internal boost converter generates 12V from its UART VCC. Powering it from the `3V` pin overloads the Feather V2's AP2112K LDO (500mA rated), starving the ESP32 and causing brownout/flicker on I2C sensors. The `USB` pin is raw VBUS before the LDO and can supply the extra current. The DFR0845 UART signal lines are 3.3V-logic compatible regardless of VCC.
+
+**RS485 screw terminal**
+
+| Terminal | Connect to |
+|----------|-----------|
+| `A` | RS485 bus A |
+| `B` | RS485 bus B |
+| `12V` | Sensor power + wire (≤ 160 mA combined) |
+| `GND` | Sensor power − wire (isolated RS485 ground) |
+
+**External 12V supply (12V-IN screw terminal)**
+
+Connect a 12V DC supply here when the three RS485 sensors together draw more than 160 mA. The internal boost converter still generates 12V from USB/UART power even when this supply is off, so **12V will appear on the `12V-IN` terminals as backfeed** any time the ESP32 is powered. Power the external supply on before or at the same time as the ESP32.
+
+**settings.toml**
+
+```toml
+RS485_AUTO_DIRECTION = true   # required — DFR0845 handles direction internally
+```
+
+D12 (GPIO12) must not be connected to the adapter.
 
 ### SEN0575 Rain Gauge wiring (STEMMA QT ↔ DFRobot Gravity JST)
 
@@ -107,9 +144,9 @@ every cycle by `code.py`.
 - **BMP390**: STEMMA QT I2C, default address `0x77`. Provides pressure (±3 Pa / ±0.25 m), temperature (±0.5 °C).
 - **SHTC3**: STEMMA QT I2C, fixed address `0x70`. Provides temperature (±0.2 °C) and humidity (±2 %RH). Chain via QT cable from BMP390 or directly from Feather V2 STEMMA QT port.
 - **HM3301**: Grove I2C, fixed address `0x40`. **Must run at ≤ 20 kHz I2C speed.** Allow 30 s warm-up. CRC failures and spurious values are common — the reader retries automatically.
-- **RS485 sensors (SEN0482/0483/0644)**: All share one RS485 bus via MAX3485 TTL module. Wired to a dedicated `busio.UART` on A0/A1 + `D12` (GPIO12) for DE/~RE direction control. D12 is a strapping pin (must be LOW at power-on) but is safe here because DE defaults LOW (receive mode) in the driver. A0 and A1 are at the far end of the 16-pin bottom row; D12 is at the far end of the 12-pin top row — directly across the board, the closest available output-capable pin. **SEN0482 and SEN0483 both default to Modbus address 0x02** — use `reader.set_address()` with each sensor connected alone to resolve the conflict before deploying on the shared bus.
+- **RS485 sensors (SEN0482/0483/0644)**: All share one RS485 bus via a [DFRobot DFR0845 Active Isolated RS485-to-UART adapter](https://www.dfrobot.com/product-2392.html). The adapter handles TX/RX direction switching internally — set `RS485_AUTO_DIRECTION = true` in `settings.toml` and do **not** wire D12. UART is on A0 (TX → module R) and A1 (RX ← module T). **Power the DFR0845 `+` pin from the Feather `USB` pin (5V VBUS), not `3V`** — its internal boost converter draws enough current to overload the AP2112K LDO and brownout the board. The RS485 screw terminal provides an isolated 12V/160mA output for sensor power; connect an external 12V supply to the `12V-IN` terminals. **Backfeed warning**: the module's internal boost converter generates 12V from UART VCC and this voltage appears on the `12V-IN` terminals even when the external supply is off — always power the external 12V supply on before or simultaneously with USB power. **SEN0482 and SEN0483 both default to Modbus address 0x02** — use `reader.set_address()` with each sensor connected alone to resolve the conflict before deploying on the shared bus.
 - **OLED FeatherWing #4650**: SH1107 128×64 monochrome display on the shared I2C bus at address `0x3C`. Three buttons are stacked vertically on the wing — TOP (C) advances to the next page, MIDDLE (B) forces a redraw, BOTTOM (A) goes back. Board pins are `A8`/`A7`/`A6` (GPIO15/32/37) on the Feather ESP32 V2 — the FeatherWing PCB labels them "5"/"6"/"9" but those Feather header positions map to different GPIO names on ESP32 than on SAMD/RP2040. The display is refreshed automatically after each sensor cycle.
-- **I2S MEMS Microphone #3421**: SPH0645LM4H-LB on a 6-pin breakout. **Not supported in the stock CircuitPython 10.2.0 ESP32 firmware**, but support is imminent: [PR #10990](https://github.com/adafruit/circuitpython/pull/10990) (opened May 8 2026, by a CircuitPython collaborator) adds a new `audio_i2sin.I2SIn` class for both Espressif and RP2040 ports and was tested on an ESP32 Huzzah Feather. To use the mic now, flash a **nightly/dev build** from [circuitpython.org/board/adafruit_feather_esp32_v2](https://circuitpython.org/board/adafruit_feather_esp32_v2/) once PR #10990 is merged. Until then, `MicrophoneReader` raises `NotImplementedError` at import time and is silently skipped by `code.py`; the SOUND LEVEL display page shows `---`. Pins: `D27` (BCLK, GPIO27), `D13` (LRCL/WS, GPIO13 — labeled **led** in the pinout PDF, also drives the red LED, harmless during audio), `A2` (DOUT, GPIO34 input-only). `SEL` is bridged to `GND` on the breakout PCB (left channel) — the Feather has only one GND header pin so both grounds are satisfied at the breakout side.
+- **I2S MEMS Microphone #3421**: SPH0645LM4H-LB on a 6-pin breakout. **Not supported in stable CircuitPython releases as of 10.2.1.** [PR #10990](https://github.com/adafruit/circuitpython/pull/10990) (opened May 8 2026) adds `audioi2sin.I2SIn` for Espressif and RP2040 ports. As of 2026-05-29 the PR is in final review (docs update pending @tannewt approval) — not yet merged. The module name was confirmed as `audioi2sin` (no underscore) during review. To use the mic, flash a **nightly build** from [circuitpython.org/board/adafruit_feather_esp32_v2](https://circuitpython.org/board/adafruit_feather_esp32_v2/) once PR #10990 merges. Until then, `MicrophoneReader` raises `NotImplementedError` and is silently skipped by `code.py`; the SOUND LEVEL display page shows `---`. Pins: `D27` (BCLK, GPIO27), `D13` (LRCL/WS, GPIO13 — labeled **led** in the pinout PDF, also drives the red LED, harmless during audio), `A2` (DOUT, GPIO34 input-only). `SEL` is bridged to `GND` on the breakout PCB (left channel) — the Feather has only one GND header pin so both grounds are satisfied at the breakout side.
 - **SEN0575**: Set DIP switch to I2C position before use. Fixed address `0x1D`. No official CircuitPython library — uses a ported raw I2C driver. Provides cumulative rainfall (mm), raw tip count, and uptime. Rolling 1-24 hour window available via `read_window(hours)`. **Wire colors are inverted** on the DFRobot JST (V=black, G=red) — see [SEN0575 Rain Gauge wiring](#sen0575-rain-gauge-wiring-stemma-qt--dfrobot-gravity-jst) for the STEMMA-QT↔Gravity mapping.
 - **I2C address map**: SEN0575 `0x1D`, HM3301 `0x40`, OLED SH1107 `0x3C`, PCF8523 `0x68`, SHTC3 `0x70`, BMP390 `0x77` — no conflicts.
 - **Power**: USB-C or LiPoly battery with built-in charging on the Feather V2.

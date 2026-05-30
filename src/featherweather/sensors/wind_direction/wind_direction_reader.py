@@ -13,6 +13,8 @@ Environment variable:
 Usage:
     reader = WindDirectionReader()
     reader.read(payload)           # populates payload.wind_direction
+    # or for diagnostics:
+    data = WindDirectionReader.verify()
 """
 
 from featherweather.sensors.rs485.rs485_sensor_base import Rs485SensorBase
@@ -57,6 +59,19 @@ class WindDirectionReader(Rs485SensorBase):
         data.direction_label = DIRECTION_LABELS[code]
         print(data)
         payload.wind_direction = data
+
+    @classmethod
+    def verify(cls) -> "WindDirectionData":
+        """Instantiate, take one reading, and return the WindDirectionData.
+
+        Raises on any hardware or communication failure.
+        """
+        from featherweather.storage.weather_payload import WeatherPayload  # noqa: PLC0415
+
+        sensor = cls()
+        payload = WeatherPayload()
+        sensor.read(payload)
+        return payload.wind_direction
 
     def set_address(self, new_address: int) -> None:
         """Reassign the Modbus slave address (persisted in sensor flash).

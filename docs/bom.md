@@ -6,11 +6,16 @@
 - [Ultimate GPS FeatherWing](https://www.adafruit.com/product/3133)
 - [oled display](https://learn.adafruit.com/adafruit-128x64-oled-featherwing)
 
-## sensors
+## RS485 adapter
+- [DFRobot DFR0845 Active Isolated RS485 to UART Signal Adapter](https://www.dfrobot.com/product-2392.html) — replaces MAX3485; galvanic isolation, auto-direction, 12V/160mA sensor power output
+
+## i2c sensors
 - [BMP390 - Barometric Pressure and Altimeter](https://www.adafruit.com/product/4816)
 - [SHTC3 Temperature & Humidity Sensor](https://www.adafruit.com/product/4636)
 - [HM3301 Laser PM2.5 Sensor](https://wiki.seeedstudio.com/Grove-Laser_PM2.5_Sensor-HM3301/)
 - [12s microphone](https://learn.adafruit.com/adafruit-i2s-mems-microphone-breakout)
+
+## rs485 sensors
 - [rain gauge — SEN0575](https://wiki.dfrobot.com/sen0575/) — DFRobot Gravity JST has **V=black / G=red** (inverse of STEMMA QT). When bridging a STEMMA QT cable, swap red↔black at the JST end. See README "SEN0575 Rain Gauge wiring".
 - [wind vane](https://wiki.dfrobot.com/sen0482/)
 - [Wind Speed](https://wiki.dfrobot.com/sen0483/)

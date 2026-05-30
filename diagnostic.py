@@ -15,6 +15,9 @@ Hardware checked
     SEN0575      tipping bucket rainfall            I2C 0x1D  (DIP → I2C mode)
     PCF8523      Adalogger FeatherWing RTC          I2C 0x68
     SH1107       OLED FeatherWing #4650 128×64      I2C 0x3C
+    SEN0482      wind direction                     RS485 Modbus (default addr 0x02)
+    SEN0483      wind speed                         RS485 Modbus (default addr 0x03)
+    SEN0644      illuminance                        RS485 Modbus (default addr 0x01)
     SPH0645      I2S MEMS microphone #3421          I2S (D27/D13/A2)
     Ultimate GPS UART NMEA activity + optional fix  board.TX / board.RX
     SD card      Adalogger FeatherWing SPI storage  board.D33 CS
@@ -34,13 +37,17 @@ from featherweather.display.display_controller import DisplayController
 from featherweather.display.neopixel_indicator import NeoPixelIndicator
 from featherweather.gps.gps_reader import GpsReader
 from featherweather.hardware.i2c_bus import get_i2c
+from featherweather.hardware.rs485_diagnostic import Rs485Diagnostic
 from featherweather.hardware.sd_card import verify_sd
 from featherweather.rtc.rtc_sync import PCF8523_I2C_ADDR, PCF8523_LABEL, get_rtc, sync_rtc_from_ntp
 from featherweather.sensors.air_quality.air_quality_reader import AirQualityReader
 from featherweather.sensors.barometric.barometric_reader import BarometricReader
+from featherweather.sensors.illuminance.illuminance_reader import IlluminanceReader
 from featherweather.sensors.microphone.microphone_reader import MicrophoneReader
 from featherweather.sensors.rainfall.rainfall_reader import RainfallReader
 from featherweather.sensors.temp_humidity.temp_humidity_reader import TempHumidityReader
+from featherweather.sensors.wind_direction.wind_direction_reader import WindDirectionReader
+from featherweather.sensors.wind_speed.wind_speed_reader import WindSpeedReader
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -472,9 +479,51 @@ def _check_sen0575():
         return None
 
 
+def _check_rs485_bus() -> None:
+    """Log RS485 UART config; does not count as a pass/fail test."""
+    _section("RS485 Bus (DFR0845 adapter)")
+    try:
+        Rs485Diagnostic(log=_log).log_bus_config()
+    except Exception as exc:  # noqa: BLE001
+        _log(f"  RS485 bus init failed: {exc}")
+
+
+def _check_wind_direction():
+    _section("SEN0482 Wind Direction Sensor (RS485)")
+    try:
+        data = WindDirectionReader.verify()
+        _result("SEN0482", True, f"{data.degrees:.1f}°  {data.direction_label}  code={data.direction_code}")
+        return data
+    except Exception as exc:  # noqa: BLE001
+        _result("SEN0482", False, str(exc))
+        return None
+
+
+def _check_wind_speed():
+    _section("SEN0483 Wind Speed Sensor (RS485)")
+    try:
+        data = WindSpeedReader.verify()
+        _result("SEN0483", True, f"{data.speed_ms:.1f} m/s  {data.beaufort}")
+        return data
+    except Exception as exc:  # noqa: BLE001
+        _result("SEN0483", False, str(exc))
+        return None
+
+
+def _check_illuminance():
+    _section("SEN0644 Illuminance Sensor (RS485)")
+    try:
+        data = IlluminanceReader.verify()
+        _result("SEN0644", True, f"{data.lux:.1f} lux")
+        return data
+    except Exception as exc:  # noqa: BLE001
+        _result("SEN0644", False, str(exc))
+        return None
+
+
 def _check_mic():
     _section("SPH0645 I2S MEMS Microphone #3421")
-    _log("  [SKIP] audio_i2sin not in stock 10.2.0 — awaiting PR #10990")
+    _log("  [SKIP] audioi2sin not in stable 10.2.1 — PR #10990 open, awaiting merge")
     return None
 
 
@@ -609,7 +658,7 @@ def _done_loop(display: DisplayController, passed: int, failed: int) -> None:
 
 _log("FeatherWeather Diagnostic Mode")
 _log(f"Started  monotonic={time.monotonic():.1f}s")
-_log("Checking: BMP390, HM3301, SHTC3, PCF8523 RTC, SH1107 OLED, SPH0645 mic, GPS, SD card")
+_log("Checking: BMP390, HM3301, SHTC3, PCF8523 RTC, SH1107 OLED, SEN0482/0483/0644 RS485, GPS, SD card")
 
 # DisplayController calls displayio.release_displays() internally and acquires
 # the shared I2C bus — must be created first.
@@ -657,6 +706,18 @@ _track(aq_data is not None)
 rain_data = _check_sen0575()
 _track(rain_data is not None)
 
+# RS485 Modbus sensors — share the DFR0845 bus on A0/A1
+_check_rs485_bus()
+
+wind_dir_data = _check_wind_direction()
+_track(wind_dir_data is not None)
+
+wind_spd_data = _check_wind_speed()
+_track(wind_spd_data is not None)
+
+illum_data = _check_illuminance()
+_track(illum_data is not None)
+
 mic_data = _check_mic()
 # Not tracked — skipped until audio_i2sin firmware support lands
 
@@ -683,8 +744,11 @@ _result("BMP390 Barometric",   baro_data is not None)
 _result("SHTC3 Temp/Humidity", th_data is not None)
 _result("HM3301 Air Quality",  aq_data is not None)
 _result("SEN0575 Rainfall",    rain_data is not None)
+_result("SEN0482 Wind Dir",    wind_dir_data is not None)
+_result("SEN0483 Wind Speed",  wind_spd_data is not None)
+_result("SEN0644 Illuminance", illum_data is not None)
 
-_log("[SKIP] SPH0645 Microphone — awaiting audio_i2sin (PR #10990)")
+_log("[SKIP] SPH0645 Microphone — awaiting audioi2sin PR #10990 merge")
 
 if gps_has_fix:
     _result("GPS", True, "fix acquired")

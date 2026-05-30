@@ -6,8 +6,9 @@ Multiple sensors can be on the bus at once (each must have a unique address).
 The adapter can be:
 
 - USB–RS485 (A/B wired straight to the sensor pair), or
-- USB–TTL (e.g. Waveshare TTL mode) wired to the **TTL** side of a MAX3485
-  board whose **A/B** side goes to the sensors (Feather not in circuit).
+- USB–TTL (e.g. Waveshare in TTL mode) wired to the **TTL** side of a
+  DFR0845 or similar RS485 adapter whose **A/B** side goes to the sensors
+  (Feather not in circuit).
 
 Requirements:
     pip install pyserial
@@ -252,7 +253,7 @@ def main() -> None:
         type=float,
         default=200.0,
         help="Delay after TX before reading RX (default 200). Try 400 for some "
-        "auto-direction MAX3485 TTL boards.",
+        "auto-direction RS485 TTL boards (e.g. DFR0845).",
     )
     parser.add_argument(
         "--read-wait-s",
@@ -306,7 +307,7 @@ def main() -> None:
                 print(f"  ERROR: {exc}")
                 print(
                     "  Check: Waveshare in TTL mode (not RS485), 3.3 V level if needed, "
-                    "GND common, sensor power, address. Swap TXD/RXD once at the MAX3485 "
+                    "GND common, sensor power, address. Swap TXD/RXD once at the adapter "
                     "header. Try:  --verbose  --post-tx-ms 400"
                 )
                 sys.exit(1)
