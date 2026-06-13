@@ -11,5 +11,6 @@ Wiring (ESP32 Feather V2):
     DOUT → board.A2   (GPIO34, input-only)
     SEL  → GND on the breakout PCB (selects left-channel output)
 
-Note: requires audiobusio.I2SIn support in the CircuitPython build.
+Note: requires audioi2sin.I2SIn (CircuitPython 10.3.0-dev / main nightly,
+2026-06-03+). Not available in stable 10.2.1.
 """

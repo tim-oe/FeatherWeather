@@ -220,7 +220,7 @@ def main() -> None:
     aq       = _try_init("HM3301  (air quality)",   AirQualityReader)
     rain     = _try_init("SEN0575 (rainfall)",      RainfallReader)
 
-    # I2S microphone — None if audio_i2sin is not in this firmware build
+    # I2S microphone — None if audioi2sin is not in this firmware build
     mic = _try_init("SPH0645 (microphone)", MicrophoneReader)
 
     # RS485 sensors — get_rs485() initialises lazily; if it fails (pins

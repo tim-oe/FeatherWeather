@@ -305,6 +305,15 @@ class TestAirQualityReader:
         data = AirQualityReader._parse(frame)
         assert data.pm_2_5_atm == 511
 
+    def test_crc_valid_accepts_good_frame(self):
+        frame = _make_aq_frame(pm_2_5_atm=22)
+        assert AirQualityReader._crc_valid(frame)
+
+    def test_crc_valid_rejects_bad_checksum(self):
+        frame = _make_aq_frame(pm_2_5_atm=22)
+        frame[28] ^= 0xFF
+        assert not AirQualityReader._crc_valid(frame)
+
     def test_read_sets_payload_air_quality(self):
         frame = _make_aq_frame(pm_1_0_atm=8, pm_2_5_atm=22, pm_10_atm=45)
 
@@ -327,6 +336,37 @@ class TestAirQualityReader:
         assert payload.air_quality.pm_1_0_atm == 8
         assert payload.air_quality.pm_2_5_atm == 22
         assert payload.air_quality.pm_10_atm == 45
+        mock_dev.write.assert_called_once()
+
+    def test_warm_up_select_sent_once_across_crc_retries(self):
+        good_frame = _make_aq_frame(pm_2_5_atm=22)
+        bad_frame = _make_aq_frame(pm_2_5_atm=22)
+        bad_frame[28] ^= 0xFF
+        frames = [bad_frame, good_frame]
+
+        mock_dev = MagicMock()
+        mock_dev.__enter__ = MagicMock(return_value=mock_dev)
+        mock_dev.__exit__ = MagicMock(return_value=False)
+        mock_dev.readinto.side_effect = lambda buf: buf.__setitem__(
+            slice(None), frames.pop(0)
+        )
+
+        with _make_i2c_patch():
+            with patch(
+                "featherweather.sensors.air_quality.air_quality_reader.I2CDevice",
+                return_value=mock_dev,
+            ):
+                with patch(
+                    "featherweather.sensors.air_quality.air_quality_reader.time.sleep"
+                ):
+                    reader = AirQualityReader(retry=2, wait_sec=0)
+
+        payload = WeatherPayload()
+        reader.read(payload)
+
+        assert payload.air_quality.pm_2_5_atm == 22
+        mock_dev.write.assert_called_once()
+        assert mock_dev.readinto.call_count == 2
 
     def test_read_raises_after_all_crc_failures(self):
         bad_frame = bytearray(
@@ -347,10 +387,16 @@ class TestAirQualityReader:
                 "featherweather.sensors.air_quality.air_quality_reader.I2CDevice",
                 return_value=mock_dev,
             ):
-                reader = AirQualityReader(retry=2, wait_sec=0)
+                with patch(
+                    "featherweather.sensors.air_quality.air_quality_reader.time.sleep"
+                ):
+                    reader = AirQualityReader(retry=2, wait_sec=0)
 
         with pytest.raises(ValueError, match="CRC failed"):
             reader.read(WeatherPayload())
+
+        mock_dev.write.assert_called_once()
+        assert mock_dev.readinto.call_count == 2
 
 
 # ---------------------------------------------------------------------------

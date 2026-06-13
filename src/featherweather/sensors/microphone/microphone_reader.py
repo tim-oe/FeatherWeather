@@ -1,12 +1,11 @@
 """I2S MEMS microphone reader for CircuitPython (Adafruit #3421, SPH0645LM4H-LB).
 
 The SPH0645 is a 24-bit I2S microphone (18-bit precision).  Reads via the
-`audioi2sin` module (CircuitPython PR #10990) which adds `audioi2sin.I2SIn`
-for Espressif and RP2040 ports.
+`audioi2sin` module (CircuitPython PR #10990, merged 2026-06-03) which adds
+`audioi2sin.I2SIn` for Espressif and RP2040 ports.
 
-PR status (as of 2026-05-29): open, under final review — not yet in any stable
-release. The module name was confirmed as `audioi2sin` (no underscore) in the
-PR. Flash a nightly build once merged:
+Not in stable 10.2.1. Available in 10.3.0 main-branch nightlies (2026-06-03+)
+until 10.3.0 beta/rc is released. Flash from "Absolute Newest" at:
     https://circuitpython.org/board/adafruit_feather_esp32_v2/
 
 Sensitivity (from datasheet):
@@ -26,10 +25,8 @@ Usage:
     print(data.db_spl)   # e.g. 58.3
 
 Firmware requirement:
-    Requires a CircuitPython build that includes `audioi2sin` (PR #10990).
-    Not available in stable releases as of 10.2.1. Flash a nightly build from
-    https://circuitpython.org/board/adafruit_feather_esp32_v2/ once the PR
-    merges into main.
+    Requires a CircuitPython build that includes `audioi2sin` (merged in
+    10.3.0-dev / main nightlies from 2026-06-03). Not in stable 10.2.1.
 
     If the module is absent, construction raises NotImplementedError and
     code.py silently skips the mic via _try_init().
@@ -41,7 +38,7 @@ import math
 import board
 
 try:
-    import audio_i2sin as _i2sin_mod
+    import audioi2sin as _i2sin_mod
 
     _I2SIn = getattr(_i2sin_mod, "I2SIn", None)
 except ImportError:
@@ -71,7 +68,7 @@ _DEFAULT_NUM_SAMPLES: int = 512
 class MicrophoneReader(SensorBase):
     """CircuitPython sound-level reader for the SPH0645LM4H-LB MEMS microphone.
 
-    Records a burst of I2S samples via audio_i2sin.I2SIn, removes DC offset,
+    Records a burst of I2S samples via audioi2sin.I2SIn, removes DC offset,
     computes RMS, and converts the result to dBFS and estimated dB SPL.
 
     Args:
@@ -113,9 +110,10 @@ class MicrophoneReader(SensorBase):
     ) -> None:
         if _I2SIn is None:
             raise NotImplementedError(
-                "audioi2sin not available in this CircuitPython build. "
-                "PR #10990 is still open (last updated 2026-05-29) — not in stable 10.2.1. "
-                "Flash a nightly build from circuitpython.org once PR #10990 merges."
+                "audioi2sin not available in this CircuitPython build "
+                "(requires 10.3.0-dev main nightly, 2026-06-03+). "
+                "Stable 10.2.1 does not include PR #10990. "
+                "Flash from circuitpython.org → Absolute Newest."
             )
         if bclk_pin is None:
             bclk_pin = board.D27

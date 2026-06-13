@@ -3,8 +3,21 @@
 No Adafruit library exists for this sensor — uses raw I2C via adafruit_bus_device.
 Implements CRC validation and retry logic from WeatherWatch.
 
-IMPORTANT: The HM3301 requires I2C bus speed <= 20 kHz.  Set the ``I2C_FREQ_HZ``
-environment variable to 20000 (the default for ``featherweather.hardware.i2c_bus``).
+The HM3301 is a notoriously finicky I2C device. Two things matter for
+reliable, crc-clean reads:
+
+1) I2C bus speed. Seeed explicitly require the bus be slowed to 20 kHz.
+   The default 100 kHz/400 kHz clock overruns the sensor and produces
+   corrupt frames / crc failures. Set the ``I2C_FREQ_HZ`` environment
+   variable to 20000 (the default for ``featherweather.hardware.i2c_bus``).
+
+2) Read sequencing. The 0x88 "select" byte is a one-time UART->I2C mode
+   switch; the reference driver issues it once at startup and then simply
+   reads 29 bytes per poll. Re-issuing select before every read adds bus
+   churn while the sensor is mid measurement, which provokes more corrupt
+   frames. We therefore warm the sensor up once and then retry the read on
+   a short, sensor-cadence backoff (the device latches a fresh frame roughly
+   once per second).
 
 Ported from https://github.com/tim-oe/WeatherWatch
 Reference: https://wiki.seeedstudio.com/Grove-Laser_PM2.5_Sensor-HM3301/
@@ -29,7 +42,8 @@ __all__ = ["AirQualityReader"]
 _SELECT_CMD: bytes = bytes([0x88])
 _DATA_LEN: int = 29
 _DEFAULT_RETRY: int = 5
-_DEFAULT_WAIT_SEC: float = 0.2
+_DEFAULT_WAIT_SEC: float = 10.0
+_RETRY_WAIT_SEC: float = 1.0
 _CEILING: int = 500
 
 
@@ -39,9 +53,9 @@ class AirQualityReader(I2cSensorBase):
     I2C address: 0x40 (fixed).
 
     Protocol (29-byte frame):
-        Write 0x88 to 0x40  ->  triggers a reading
-        Read  29 bytes       ->  raw data frame
-        Byte 28              ->  CRC = sum(bytes[0:28]) & 0xFF
+        Write 0x88 to 0x40 once  ->  switch sensor to I2C output mode
+        Read  29 bytes per poll  ->  raw data frame
+        Byte 28                  ->  CRC = sum(bytes[0:28]) & 0xFF
     """
 
     _I2C_ADDR: int = 0x40
@@ -56,6 +70,10 @@ class AirQualityReader(I2cSensorBase):
     ) -> None:
         self._retry = retry
         self._wait_sec = wait_sec
+        # the 0x88 select / stabilization only needs to happen once for the
+        # life of the process; tracked here so repeated reads don't re-toggle
+        # the sensor mode on every poll
+        self._warmed_up: bool = False
         super().__init__(address)
 
     def _init_device(self, i2c, address: int) -> None:
@@ -81,7 +99,7 @@ class AirQualityReader(I2cSensorBase):
         Raises on any hardware or communication failure.
         """
         time.sleep(cls._VERIFY_WARMUP_S)
-        sensor = cls(retry=8, wait_sec=0.3)
+        sensor = cls(retry=8)
         payload = WeatherPayload()
         sensor.read(payload)
         return payload.air_quality
@@ -90,20 +108,40 @@ class AirQualityReader(I2cSensorBase):
     # Internal
     # ------------------------------------------------------------------
 
+    def _warm_up(self) -> None:
+        """Switch the sensor to I2C output mode and let it stabilize.
+
+        This is a one-time operation; the 0x88 select byte is a UART->I2C
+        mode switch and the datasheet calls for settle time after power-on
+        before readings are trustworthy.
+        """
+        if self._warmed_up:
+            return
+
+        with self._device as dev:
+            dev.write(_SELECT_CMD)
+        time.sleep(self._wait_sec)
+        self._warmed_up = True
+
     def _read_validated(self) -> AirQualityData:
         """Run the CRC-validated read loop and return AirQualityData."""
+        self._warm_up()
         buf = bytearray(_DATA_LEN)
 
         for attempt in range(self._retry):
-            with self._device as dev:
-                dev.write(_SELECT_CMD)
-            time.sleep(self._wait_sec)
-            with self._device as dev:
-                dev.readinto(buf)
+            try:
+                self._read_frame(buf)
+            except OSError as exc:
+                print(
+                    f"AirQuality i2c read failed "
+                    f"(attempt {attempt + 1}/{self._retry}): {exc}"
+                )
+                time.sleep(_RETRY_WAIT_SEC)
+                continue
 
-            crc = sum(buf[: _DATA_LEN - 1]) & 0xFF
-            if crc != buf[28]:
+            if not self._crc_valid(buf):
                 print(f"AirQuality CRC failed (attempt {attempt + 1}/{self._retry})")
+                time.sleep(_RETRY_WAIT_SEC)
                 continue
 
             data = self._parse(buf)
@@ -121,17 +159,28 @@ class AirQualityReader(I2cSensorBase):
 
         raise ValueError(f"AirQuality: CRC failed after {self._retry} attempts")
 
-    def _read_one(self, buf: bytearray) -> "AirQualityData | None":
-        """Single extra read for out-of-range clamping."""
-        with self._device as dev:
-            dev.write(_SELECT_CMD)
-        time.sleep(self._wait_sec)
+    def _read_frame(self, buf: bytearray) -> None:
+        """Read one 29-byte frame from the sensor."""
         with self._device as dev:
             dev.readinto(buf)
-        crc = sum(buf[: _DATA_LEN - 1]) & 0xFF
-        if crc != buf[28]:
+
+    def _read_one(self, buf: bytearray) -> "AirQualityData | None":
+        """Single extra read for out-of-range clamping (no re-select)."""
+        try:
+            self._read_frame(buf)
+        except OSError:
+            return None
+        if not self._crc_valid(buf):
             return None
         return self._parse(buf)
+
+    @staticmethod
+    def _crc_valid(buf: bytearray) -> bool:
+        """Return True when the trailing checksum byte matches the frame sum."""
+        if len(buf) != _DATA_LEN:
+            return False
+        crc = sum(buf[: _DATA_LEN - 1]) & 0xFF
+        return crc == buf[_DATA_LEN - 1]
 
     @staticmethod
     def _parse(buf: bytearray) -> AirQualityData:

@@ -66,7 +66,9 @@ class WindDirectionReader(Rs485SensorBase):
 
         Raises on any hardware or communication failure.
         """
-        from featherweather.storage.weather_payload import WeatherPayload  # noqa: PLC0415
+        from featherweather.storage.weather_payload import (  # noqa: PLC0415
+            WeatherPayload,
+        )
 
         sensor = cls()
         payload = WeatherPayload()

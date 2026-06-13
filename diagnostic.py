@@ -523,8 +523,16 @@ def _check_illuminance():
 
 def _check_mic():
     _section("SPH0645 I2S MEMS Microphone #3421")
-    _log("  [SKIP] audioi2sin not in stable 10.2.1 — PR #10990 open, awaiting merge")
-    return None
+    try:
+        data = MicrophoneReader.verify()
+        _result("SPH0645", True, f"{data.db_spl:.1f} dB SPL  rms={data.rms:.1f}")
+        return data, False
+    except NotImplementedError as exc:
+        _log(f"  [SKIP] {exc}")
+        return None, True
+    except Exception as exc:  # noqa: BLE001
+        _result("SPH0645", False, str(exc))
+        return None, False
 
 
 # ---------------------------------------------------------------------------
@@ -718,8 +726,9 @@ _track(wind_spd_data is not None)
 illum_data = _check_illuminance()
 _track(illum_data is not None)
 
-mic_data = _check_mic()
-# Not tracked — skipped until audio_i2sin firmware support lands
+mic_data, mic_skipped = _check_mic()
+if not mic_skipped:
+    _track(mic_data is not None)
 
 # GPS is on UART, not I2C
 gps, gps_has_fix = _check_gps()
@@ -748,7 +757,10 @@ _result("SEN0482 Wind Dir",    wind_dir_data is not None)
 _result("SEN0483 Wind Speed",  wind_spd_data is not None)
 _result("SEN0644 Illuminance", illum_data is not None)
 
-_log("[SKIP] SPH0645 Microphone — awaiting audioi2sin PR #10990 merge")
+if mic_skipped:
+    _log("[SKIP] SPH0645 Microphone — needs audioi2sin (10.3.0-dev nightly)")
+else:
+    _result("SPH0645 Microphone", mic_data is not None)
 
 if gps_has_fix:
     _result("GPS", True, "fix acquired")
