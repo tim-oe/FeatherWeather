@@ -5,8 +5,15 @@ server when the /lib tree is deep).  Instead, extracts the needed .mpy
 files from the locally-cached Adafruit CircuitPython Bundle and uploads
 them via WiFi (default) or serial/mpremote (--serial).
 
+Before uploading, stale files are removed from the device: anything inside a
+package directory (``/lib/<pkg>/``) that the new bundle no longer ships, and
+the ``.py``/``.mpy`` counterpart of single-file modules.  CircuitPython prefers
+``.py`` over ``.mpy`` when both exist, so a leftover ``__init__.py`` from an
+older bundle release would silently shadow the freshly uploaded ``__init__.mpy``.
+
 The bundle is downloaded by circup and lives at:
     ~/.local/share/circup/adafruit-circuitpython-bundle-<ver>mpy.zip
+See README "Install CircuitPython libraries on device" for how to prime it.
 
 Usage:
     poetry run circup-install                       # WiFi upload
@@ -16,6 +23,7 @@ Usage:
 
 import argparse
 import base64
+import json
 import shutil
 import subprocess
 import sys
@@ -92,6 +100,36 @@ def _mkdir(host: str, remote_dir: str, auth: dict) -> None:
             raise RuntimeError(f"mkdir {url} → HTTP {exc.code}") from exc
 
 
+def _delete(host: str, remote_path: str, auth: dict) -> None:
+    url = f"http://{host}/fs/{remote_path}"
+    req = urllib.request.Request(url, headers=auth, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=15):
+            pass
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (200, 204, 404):
+            raise RuntimeError(f"DELETE {url} → HTTP {exc.code}") from exc
+
+
+def _listdir(host: str, remote_dir: str, auth: dict) -> list[tuple[str, bool]] | None:
+    """Return [(name, is_dir), ...] for *remote_dir*, or None if it does not exist.
+
+    Handles both Web Workflow JSON shapes: a bare list (CP 8) and
+    ``{"files": [...]}`` (CP 9+).
+    """
+    url = f"http://{host}/fs/{remote_dir.rstrip('/')}/"
+    req = urllib.request.Request(url, headers={**auth, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise RuntimeError(f"GET {url} → HTTP {exc.code}") from exc
+    files = payload["files"] if isinstance(payload, dict) else payload
+    return [(f["name"], bool(f.get("directory"))) for f in files]
+
+
 def _find_bundle(cp_major: int = 10) -> Path:
     """Return the path to the best matching bundle zip for cp_major."""
     candidates = sorted(
@@ -111,7 +149,8 @@ def _find_bundle(cp_major: int = 10) -> Path:
         return candidates[0]
     raise FileNotFoundError(
         f"No Adafruit CircuitPython bundle found in {BUNDLE_CACHE_DIR}.\n"
-        "Run: circup --host <device-ip> install neopixel   (once, to prime the cache)"
+        "Prime the cache once (no device needed) — see README "
+        "'Install CircuitPython libraries on device', Step 1."
     )
 
 
@@ -148,6 +187,46 @@ def _remote_path(zip_entry: str) -> str:
     """Strip everything up to and including '/lib/' to get the device path."""
     idx = zip_entry.find("/lib/")
     return "lib/" + zip_entry[idx + len("/lib/"):]
+
+
+# ---------------------------------------------------------------------------
+# Shared: stale-file cleanup plan
+# ---------------------------------------------------------------------------
+
+
+def _plan_cleanup(
+    module_remote_paths: dict[str, list[str]],
+) -> tuple[set[str], list[str], list[str]]:
+    """Work out what must be removed from the device before uploading.
+
+    *module_remote_paths* maps module name → list of ``lib/...`` paths that the
+    bundle provides for it.  Returns ``(keep, package_dirs, stale_siblings)``:
+
+    - ``keep``           every path the new bundle provides (never delete these)
+    - ``package_dirs``   ``lib/<pkg>`` directories to sweep for files not in ``keep``
+    - ``stale_siblings`` for single-file modules, the opposite-extension twin
+                         (``lib/foo.py`` when uploading ``lib/foo.mpy`` and vice
+                         versa) — a leftover ``.py`` would shadow the ``.mpy``
+    """
+    keep: set[str] = set()
+    package_dirs: list[str] = []
+    stale_siblings: list[str] = []
+
+    for module_name, paths in module_remote_paths.items():
+        keep.update(paths)
+        pkg_dir = f"lib/{module_name}"
+        if any(p.startswith(pkg_dir + "/") for p in paths):
+            package_dirs.append(pkg_dir)
+            continue
+        for p in paths:
+            if p.endswith(".mpy"):
+                stale_siblings.append(p[: -len(".mpy")] + ".py")
+            elif p.endswith(".py"):
+                stale_siblings.append(p[: -len(".py")] + ".mpy")
+
+    # A sibling can never be something we also upload.
+    stale_siblings = [s for s in stale_siblings if s not in keep]
+    return keep, package_dirs, stale_siblings
 
 
 # ---------------------------------------------------------------------------
@@ -191,15 +270,26 @@ def install_wifi(host: str, password: str, module_names: list[str], bundle_path:
 
     uploaded = 0
     skipped = 0
+    removed = 0
 
     with zipfile.ZipFile(bundle_path) as zf:
+        module_entries: dict[str, list[str]] = {}
         for module_name in module_names:
             entries = _extract_lib_entries(zf, module_name)
             if not entries:
                 print(f"  [WARN] {module_name} — not found in bundle")
                 skipped += 1
                 continue
+            module_entries[module_name] = entries
 
+        # -- Remove stale files left over from older bundle releases ---------
+        keep, package_dirs, stale_siblings = _plan_cleanup(
+            {m: [_remote_path(e) for e in ents] for m, ents in module_entries.items()}
+        )
+        removed += _wifi_remove_stale(host, auth, keep, package_dirs, stale_siblings)
+
+        # -- Upload ----------------------------------------------------------
+        for module_name, entries in module_entries.items():
             for entry in entries:
                 remote = _remote_path(entry)
                 # Create any intermediate directories the entry requires
@@ -210,13 +300,107 @@ def install_wifi(host: str, password: str, module_names: list[str], bundle_path:
                 print(f"  uploaded  {remote}")
                 uploaded += 1
 
-    print(f"\nDone — {uploaded} file(s) uploaded, {skipped} skipped.")
+    print(
+        f"\nDone — {uploaded} file(s) uploaded, {removed} stale removed, "
+        f"{skipped} skipped."
+    )
     return 0
+
+
+def _wifi_remove_stale(
+    host: str,
+    auth: dict,
+    keep: set[str],
+    package_dirs: list[str],
+    stale_siblings: list[str],
+) -> int:
+    """Delete files on the device that the new bundle does not provide.
+
+    Returns the number of files removed.
+    """
+    removed = 0
+
+    def sweep(remote_dir: str) -> None:
+        nonlocal removed
+        listing = _listdir(host, remote_dir, auth)
+        if listing is None:
+            return
+        for name, is_dir in listing:
+            path = f"{remote_dir}/{name}"
+            if is_dir:
+                sweep(path)
+                # Drop the directory if it no longer holds anything we keep
+                if not any(k.startswith(path + "/") for k in keep):
+                    _delete(host, path + "/", auth)
+            elif path not in keep:
+                _delete(host, path, auth)
+                print(f"  removed   {path}  (stale)")
+                removed += 1
+
+    try:
+        for pkg_dir in package_dirs:
+            sweep(pkg_dir)
+        for sibling in stale_siblings:
+            parent, _, name = sibling.rpartition("/")
+            listing = _listdir(host, parent, auth) or []
+            if any(n == name and not d for n, d in listing):
+                _delete(host, sibling, auth)
+                print(f"  removed   {sibling}  (stale)")
+                removed += 1
+    except (RuntimeError, urllib.error.URLError, TimeoutError) as exc:
+        print(f"  [WARN] stale-file cleanup incomplete: {exc}")
+    return removed
 
 
 # ---------------------------------------------------------------------------
 # Serial install (mpremote)
 # ---------------------------------------------------------------------------
+
+
+def _serial_cleanup_code(
+    keep: set[str], package_dirs: list[str], stale_siblings: list[str]
+) -> list[str]:
+    """Return CircuitPython source lines (``mpremote exec``) that remove stale files.
+
+    Walks each ``/lib/<pkg>/`` directory and deletes files not in *keep*, then
+    prunes directories left empty, then removes any *stale_siblings* that exist.
+    Everything is wrapped in try/except so a missing path never aborts the session.
+    """
+    keep_abs = sorted("/" + k for k in keep)
+    pkg_abs = ["/" + d for d in package_dirs]
+    sib_abs = ["/" + s for s in stale_siblings]
+    return [
+        "import os",
+        f"KEEP = {keep_abs!r}",
+        "def _sweep(d):",
+        "    try:",
+        "        names = os.listdir(d)",
+        "    except OSError:",
+        "        return",
+        "    for n in names:",
+        "        p = d + '/' + n",
+        "        try:",
+        "            isdir = os.stat(p)[0] & 0x4000",
+        "        except OSError:",
+        "            continue",
+        "        if isdir:",
+        "            _sweep(p)",
+        "            try:",
+        "                os.rmdir(p)",
+        "            except OSError:",
+        "                pass",
+        "        elif p not in KEEP:",
+        "            os.remove(p)",
+        "            print('  removed   ' + p[1:] + '  (stale)')",
+        f"for _d in {pkg_abs!r}:",
+        "    _sweep(_d)",
+        f"for _s in {sib_abs!r}:",
+        "    try:",
+        "        os.remove(_s)",
+        "        print('  removed   ' + _s[1:] + '  (stale)')",
+        "    except OSError:",
+        "        pass",
+    ]
 
 
 def install_serial(port: str, module_names: list[str], bundle_path: Path) -> int:
@@ -229,6 +413,7 @@ def install_serial(port: str, module_names: list[str], bundle_path: Path) -> int
         tmp_path = Path(tmp)
         extracted = 0
         skipped = 0
+        module_remote_paths: dict[str, list[str]] = {}
 
         with zipfile.ZipFile(bundle_path) as zf:
             for module_name in module_names:
@@ -237,13 +422,17 @@ def install_serial(port: str, module_names: list[str], bundle_path: Path) -> int
                     print(f"  [WARN] {module_name} — not found in bundle")
                     skipped += 1
                     continue
+                module_remote_paths[module_name] = []
                 for entry in entries:
                     rel = _remote_path(entry)            # e.g. lib/adafruit_sdcard.mpy
+                    module_remote_paths[module_name].append(rel)
                     dest = tmp_path / rel[len("lib/"):]  # strip leading lib/
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     dest.write_bytes(zf.read(entry))
                     extracted += 1
                 print(f"  extracted {module_name}  ({len(entries)} file(s))")
+
+        keep, package_dirs, stale_siblings = _plan_cleanup(module_remote_paths)
 
         # Collect subdirectory paths that need to be created on the device.
         # "lib" is omitted — it always exists on any CircuitPython device.
@@ -258,13 +447,13 @@ def install_serial(port: str, module_names: list[str], bundle_path: Path) -> int
 
         print(f"\nUploading {extracted} file(s) via mpremote ...")
 
-        # Single mpremote session: exec (mkdir + touch) then cp all files.
+        # Single mpremote session: exec (clean + mkdir + touch) then cp all files.
         # Pre-touching every destination file lets fs_exists return True,
         # sidestepping the _convert_filesystem_error bug for absent files.
         # -f skips the per-file hash read round-trip (files are empty anyway).
         file_entries = sorted(fn for fn in tmp_path.rglob("*") if fn.is_file())
 
-        mkdir_lines = ["import os"]
+        mkdir_lines = _serial_cleanup_code(keep, package_dirs, stale_siblings)
         for d in dirs_to_create:
             mkdir_lines += [
                 "try:",
@@ -279,7 +468,10 @@ def install_serial(port: str, module_names: list[str], bundle_path: Path) -> int
         mkdir_code = "\n".join(mkdir_lines) + "\n"
 
         if dirs_to_create or file_entries:
-            print(f"  Creating {len(dirs_to_create)} directories + touching {len(file_entries)} files ...")
+            print(
+                f"  Sweeping {len(package_dirs)} package dir(s) for stale files, "
+                f"creating {len(dirs_to_create)} directories + touching {len(file_entries)} files ..."
+            )
 
         chain: list[str] = ["mpremote", "connect", port, "+", "exec", mkdir_code]
         for fn in file_entries:

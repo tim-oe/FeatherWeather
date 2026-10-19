@@ -12,7 +12,7 @@ Three transport modes are supported:
   Serial / mpremote  (--serial)
     Transfers files over the USB-serial port using mpremote.
     Use when WiFi is unavailable or the device is in a broken state.
-    The Feather ESP32 V2 uses a CH340 USB-to-serial chip; it never exposes a
+    The Feather ESP32 V2 uses a CH343 USB-to-serial chip; it never exposes a
     CIRCUITPY mass-storage drive, so this is the correct USB recovery path.
     Requires: poetry run mpremote (already a project dependency).
 

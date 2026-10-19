@@ -146,7 +146,7 @@ every cycle by `code.py`.
 - **HM3301**: Grove I2C, fixed address `0x40`. **Must run at ≤ 20 kHz I2C speed.** Allow 30 s warm-up. CRC failures and spurious values are common — the reader retries automatically.
 - **RS485 sensors (SEN0482/0483/0644)**: All share one RS485 bus via a [DFRobot DFR0845 Active Isolated RS485-to-UART adapter](https://www.dfrobot.com/product-2392.html). The adapter handles TX/RX direction switching internally — set `RS485_AUTO_DIRECTION = true` in `settings.toml` and do **not** wire D12. UART is on A0 (TX → module R) and A1 (RX ← module T). **Power the DFR0845 `+` pin from the Feather `USB` pin (5V VBUS), not `3V`** — its internal boost converter draws enough current to overload the AP2112K LDO and brownout the board. The RS485 screw terminal provides an isolated 12V/160mA output for sensor power; connect an external 12V supply to the `12V-IN` terminals. **Backfeed warning**: the module's internal boost converter generates 12V from UART VCC and this voltage appears on the `12V-IN` terminals even when the external supply is off — always power the external 12V supply on before or simultaneously with USB power. **SEN0482 and SEN0483 both default to Modbus address 0x02** — use `reader.set_address()` with each sensor connected alone to resolve the conflict before deploying on the shared bus.
 - **OLED FeatherWing #4650**: SH1107 128×64 monochrome display on the shared I2C bus at address `0x3C`. Three buttons are stacked vertically on the wing — TOP (C) advances to the next page, MIDDLE (B) forces a redraw, BOTTOM (A) goes back. Board pins are `A8`/`A7`/`A6` (GPIO15/32/37) on the Feather ESP32 V2 — the FeatherWing PCB labels them "5"/"6"/"9" but those Feather header positions map to different GPIO names on ESP32 than on SAMD/RP2040. The display is refreshed automatically after each sensor cycle.
-- **I2S MEMS Microphone #3421**: SPH0645LM4H-LB on a 6-pin breakout. Requires `audioi2sin.I2SIn` from [CircuitPython PR #10990](https://github.com/adafruit/circuitpython/pull/10990) (merged 2026-06-03). **Not in stable 10.2.1** — use a **10.3.0-dev main nightly** (2026-06-03 or later) from [circuitpython.org/board/adafruit_feather_esp32_v2](https://circuitpython.org/board/adafruit_feather_esp32_v2/) → **Absolute Newest** until 10.3.0 beta/rc ships. On older firmware, `MicrophoneReader` raises `NotImplementedError` and is silently skipped by `code.py`; the SOUND LEVEL display page shows `---`. Pins: `D27` (BCLK, GPIO27), `D13` (LRCL/WS, GPIO13 — labeled **led** in the pinout PDF, also drives the red LED, harmless during audio), `A2` (DOUT, GPIO34 input-only). `SEL` is bridged to `GND` on the breakout PCB (left channel) — the Feather has only one GND header pin so both grounds are satisfied at the breakout side.
+- **I2S MEMS Microphone #3421**: SPH0645LM4H-LB on a 6-pin breakout. Requires `audioi2sin.I2SIn` ([CircuitPython PR #10990](https://github.com/adafruit/circuitpython/pull/10990)), which shipped in **CircuitPython 10.3.0 stable** (2026-08-31) and is in every 10.3.x release for the Feather ESP32 V2 — use the current stable from [circuitpython.org/board/adafruit_feather_esp32_v2](https://circuitpython.org/board/adafruit_feather_esp32_v2/). On older firmware (≤ 10.2.x), `MicrophoneReader` raises `NotImplementedError` and is silently skipped by `code.py`; the SOUND LEVEL display page shows `---`. `MicrophoneReader` configures the bus for this mic specifically (`bit_depth=32`, `left_justified=True`, 16 kHz → 1.024 MHz BCLK); the `audioi2sin` defaults (16-bit, classic I2S) produce a 512 kHz BCLK the SPH0645 won't run on and yield all-zero samples. Construction takes ~1 s because the reader records and discards bursts while the mic's internal high-pass filter settles — without that, the first reading is 5–30× too loud. With the mic **not wired**, every sample is exactly zero and `diagnostic.py` reports `[FAIL] SPH0645 … mic returned all-zero samples`; a wired mic in a quiet room reads roughly 50–60 dB SPL (uncalibrated, ±3–5 dB). Pins: `D27` (BCLK, GPIO27), `D13` (LRCL/WS, GPIO13 — labeled **led** in the pinout PDF, also drives the red LED, harmless during audio), `A2` (DOUT, GPIO34 input-only). `SEL` is bridged to `GND` on the breakout PCB (left channel) — the Feather has only one GND header pin so both grounds are satisfied at the breakout side.
 - **SEN0575**: Set DIP switch to I2C position before use. Fixed address `0x1D`. No official CircuitPython library — uses a ported raw I2C driver. Provides cumulative rainfall (mm), raw tip count, and uptime. Rolling 1-24 hour window available via `read_window(hours)`. **Wire colors are inverted** on the DFRobot JST (V=black, G=red) — see [SEN0575 Rain Gauge wiring](#sen0575-rain-gauge-wiring-stemma-qt--dfrobot-gravity-jst) for the STEMMA-QT↔Gravity mapping.
 - **I2C address map**: SEN0575 `0x1D`, HM3301 `0x40`, OLED SH1107 `0x3C`, PCF8523 `0x68`, SHTC3 `0x70`, BMP390 `0x77` — no conflicts.
 - **Power**: USB-C or LiPoly battery with built-in charging on the Feather V2.
@@ -166,29 +166,82 @@ cp settings.toml.example settings.toml
 # edit settings.toml: WiFi, MQTT, sensor timings, etc.
 ```
 
-For WiFi-assisted workflows (`circup-install`, `deploy`), set **`ESP32_IP`** to your board's address on the LAN and **`CIRCUITPY_WEB_API_PASSWORD`** to match the CircuitPython WiFi / Web Workflow password you configured on the device (see [CircuitPython workflows](https://docs.circuitpython.org/en/latest/docs/workflows.html)). Empty password skips the `--password` flag for `circup-install`; `deploy` still sends Basic Auth and may fail if the device requires a password.
+For WiFi-assisted workflows (`circup-install`, `deploy`), set **`ESP32_IP`** to your board's address on the LAN and **`CIRCUITPY_WEB_API_PASSWORD`** to match the CircuitPython WiFi / Web Workflow password you configured on the device (see [CircuitPython workflows](https://docs.circuitpython.org/en/latest/docs/workflows.html)). Both scripts send HTTP Basic Auth with that password on every request; if the device has a password set and `settings.toml` doesn't match, uploads fail with HTTP 401.
+
+`ESP32_IP` is empty in `settings.toml.example`; if it is left blank or commented out, the WiFi scripts exit with `ESP32_IP not set`. To find the board's address, connect over serial (the REPL title bar shows it) or run:
+
+```bash
+poetry run mpremote connect /dev/ttyACM0 exec "import wifi; print(wifi.radio.ipv4_address)"
+```
 
 ### Flash CircuitPython firmware
+get firmware from [circuitpython.org](https://circuitpython.org/board/adafruit_feather_esp32_v2/)
 
 ```bash
 # Download CircuitPython .bin for ESP32 Feather V2 from circuitpython.org
-# Stable 10.2.1 for most sensors; I2S mic needs 10.3.0-dev main nightly (2026-06-03+)
-# wget https://downloads.circuitpython.org/bin/adafruit_feather_esp32_v2/en_US/adafruit-circuitpython-adafruit_feather_esp32_v2-en_US-<VER>.bin
+# Use current stable, >= 10.3.0 (the I2S mic needs audioi2sin, added in 10.3.0). Tested on 10.3.1.
+# wget https://downloads.circuitpython.org/bin/adafruit_feather_esp32_v2/en_US/adafruit-circuitpython-adafruit_feather_esp32_v2-en_US-10.3.1.bin
 # then flash:
-poetry run esptool --chip esp32 --port /dev/ttyUSB0 write_flash -z 0x0 adafruit-circuitpython-adafruit_feather_esp32_v2-en_US-*.bin
+poetry run esptool --chip esp32 --port /dev/ttyACM0 write_flash -z 0x0 adafruit-circuitpython-adafruit_feather_esp32_v2-en_US-*.bin
 ```
+
+The board's USB-serial bridge is a WCH **CH343** (USB ID `1a86:55d4`), which enumerates as CDC-ACM — so it appears as **`/dev/ttyACM0`** on Linux, not `/dev/ttyUSB0`. Check with `ls /dev/ttyACM*` if unsure. Opening the port with DTR asserted (pyserial's default) holds the ESP32 in reset via the bridge's EN/IO0 auto-reset circuit; `mpremote` and `esptool` handle this for you, but if you script raw serial reads set `dtr=False, rts=False` before opening.
 
 ### Install CircuitPython libraries on device
 
-**WiFi (`circup` against the device's Web Workflow)**
+`poetry run circup-install` reads every `adafruit-circuitpython-*` dependency from **`pyproject.toml`** (host-only packages like Blinka are skipped), extracts the matching `.mpy` files from the **locally cached Adafruit CircuitPython Bundle**, and uploads them to `/lib` on the board. It does not use `circup install` directly because circup's HTTP directory scan times out against the ESP32 Web Workflow once `/lib` is populated.
 
-After the board has joined Wi‑Fi with Web Workflow enabled, install Adafruit bundles listed in **`pyproject.toml`** using the IP and optional API password from **`settings.toml`**:
+Before uploading, it **removes stale files** the new bundle no longer ships: anything inside a package directory (`/lib/<pkg>/`) that isn't in the bundle, and the `.py`/`.mpy` twin of single-file modules. This matters because CircuitPython prefers `.py` over `.mpy` when both exist — e.g. a leftover empty `adafruit_register/__init__.py` from an older release silently shadows the new `__init__.mpy` and every `adafruit_register` consumer then fails with `no module named 'adafruit_register._BUFFER'`. Removed files are listed in the output as `removed … (stale)`. Only the package directories and module files named in `pyproject.toml` are touched; `/lib/featherweather/` and anything else on the board is left alone.
+
+**Step 1 — prime the bundle cache (once per machine)**
+
+The script does **not** download the bundle itself. It looks for `~/.local/share/circup/adafruit-circuitpython-bundle-10mpy.zip`, which `circup` creates the first time it installs against a CircuitPython 10 device. On a fresh machine you'll see:
+
+```
+FileNotFoundError: No Adafruit CircuitPython bundle found in /home/<user>/.local/share/circup.
+```
+
+Prime it without a device by pointing `circup` at a stub directory that advertises the board's CircuitPython version (match the major version — `10.x` — to what's flashed on the board):
+
+```bash
+mkdir -p /tmp/fakecp/lib
+printf 'Adafruit CircuitPython 10.3.1 on 2026-09-14; Adafruit Feather ESP32 V2 with ESP32\nBoard ID:adafruit_feather_esp32_v2\n' > /tmp/fakecp/boot_out.txt
+poetry run circup --path /tmp/fakecp install neopixel
+rm -rf /tmp/fakecp
+ls ~/.local/share/circup/        # should now contain adafruit-circuitpython-bundle-10mpy.zip
+```
+
+(If the board is reachable over WiFi, `poetry run circup --host <ESP32_IP> --password <pw> install neopixel` primes the same cache.) The script always picks the newest `10*mpy.zip` in the cache; re-run the priming step to pull a newer bundle release.
+
+**Step 2a — WiFi (default)**
+
+Requires Web Workflow enabled, the board on the LAN, and **`ESP32_IP`** / **`CIRCUITPY_WEB_API_PASSWORD`** set in **`settings.toml`** (there are no `--host` / `--password` flags; the script only reads `settings.toml`):
 
 ```bash
 poetry run circup-install
 ```
 
-This extracts each `adafruit-circuitpython-*` dependency from the locally cached Adafruit CircuitPython Bundle (host-only packages like Blinka are skipped) and uploads them via Web Workflow. Override with **`--host`** / **`--password`** is not wired in this script—it always reads **`ESP32_IP`** and **`CIRCUITPY_WEB_API_PASSWORD`** from `settings.toml`. Use **`--serial`** for USB-serial install via mpremote when WiFi is unavailable.
+**Step 2b — USB-serial (`--serial`)**
+
+Use for first bring-up, when the board isn't on WiFi, or when the host can't reach it (e.g. WiFi client isolation — a board that reports `wifi.radio.connected == True` can still be unreachable from your machine). Uploads via **`mpremote`** over the USB-serial port; no `settings.toml` network values are needed.
+
+```bash
+poetry run circup-install --serial                       # default port /dev/ttyACM0
+poetry run circup-install --serial --port /dev/ttyACM1
+```
+
+Notes for serial mode:
+
+- **`mpremote.transport.TransportError: could not enter raw repl`** on the first attempt is common when `code.py` is mid-loop — mpremote's Ctrl-C lands while the board is busy. Just re-run the command; the board is now idle at the REPL and the second attempt goes through.
+- Entering the REPL stops `code.py`, which owns the WiFi/MQTT connection. The board stays offline until it is reset — after the install finishes, run `poetry run mpremote connect /dev/ttyACM0 reset` (or press the board's RESET button) so `code.py` restarts.
+- A full install of the current dependency list is ~30 files and takes about 90 s.
+- If a library import fails right after an install with `no module named '<pkg>.<name>'` for a name that is clearly an attribute, not a submodule (e.g. `adafruit_register._BUFFER`), a stale `.py` is shadowing a new `.mpy`. Re-running `circup-install` clears it (see the stale-file note above), or remove the file by hand with `mpremote … exec "import os; os.remove('/lib/<pkg>/<file>.py')"`.
+
+Verify what landed on the board:
+
+```bash
+poetry run mpremote connect /dev/ttyACM0 exec "import os; print(sorted(os.listdir('/lib')))"
+```
 
 **USB mass storage**
 
@@ -225,14 +278,15 @@ After tests pass locally, **`poetry run deploy`** uploads firmware sources over 
 | `pylint` | ^3.3 | Static analysis |
 | `pytest` | ^8.3 | Test runner |
 | `pytest-cov` | ^6.0 | Coverage → `reports/htmlcov/` |
-| `esptool` | ^4.7 | Flash ESP32 firmware |
-| `circup` | ^2.0 | Manage CircuitPython libs on device |
+| `esptool` | ^5.2 | Flash ESP32 firmware |
+| `circup` | ^3.0 | Downloads/caches the Adafruit CircuitPython Bundle used by `circup-install` |
+| `mpremote` | >=1.24 | USB-serial file transfer + REPL (`--serial` modes) |
 
 ### Convenience scripts (`pyproject.toml`)
 
 | Entry point | Runs |
 |-------------|------|
-| `poetry run circup-install` | Reads `pyproject.toml` + `settings.toml`; runs **`circup --host`** (and **`--password`** if set) to install CP libraries |
+| `poetry run circup-install` | Reads `adafruit-circuitpython-*` deps from `pyproject.toml`, extracts them from the cached bundle in `~/.local/share/circup/`, and uploads to `/lib` via Web Workflow (**`ESP32_IP`** + **`CIRCUITPY_WEB_API_PASSWORD`** from `settings.toml`) or **`--serial`** via mpremote |
 | `poetry run deploy` | Runs **`pytest`** on `tests/`; on success uploads **`code.py`** and **`src/featherweather/`** → `lib/featherweather/` via HTTP PUT to **`http://<ESP32_IP>/fs/...`** (Web Workflow; uses **`CIRCUITPY_WEB_API_PASSWORD`** for Basic Auth) |
 
 `poetry run deploy --skip-tests` uploads without running tests (use sparingly).
@@ -251,7 +305,7 @@ This runs **`pytest tests/ -v --tb=short`** first (no HTML coverage report; use 
 
 ### Deploy over USB-serial (`deploy --serial`)
 
-Use when WiFi is unavailable or the device is in a broken state. The Feather ESP32 V2 uses a CH340 USB-to-serial bridge (no native USB), so this is the only USB recovery path — there is no CIRCUITPY mass-storage drive on this board.
+Use when WiFi is unavailable or the device is in a broken state. The Feather ESP32 V2 uses a CH343 USB-to-serial bridge (no native USB), so this is the only USB recovery path — there is no CIRCUITPY mass-storage drive on this board.
 
 ```bash
 poetry run deploy --serial                       # default port /dev/ttyACM0
@@ -327,7 +381,7 @@ src/featherweather/
     └── rs485/          # shared Modbus RTU master used by all RS485 sensors
 tests/
 scripts/
-├── circup_install.py   # CP libs from pyproject.toml → circup over Wi‑Fi
+├── circup_install.py   # CP libs from pyproject.toml → cached bundle → Wi‑Fi or --serial
 ├── deploy.py           # test then upload code.py + featherweather via Web Workflow
 ├── lint.py             # isort + black + flake8 runner
 ├── read_rs485_sensor.py  # host Modbus sanity check (USB-RS485)

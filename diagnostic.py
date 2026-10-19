@@ -758,7 +758,7 @@ _result("SEN0483 Wind Speed",  wind_spd_data is not None)
 _result("SEN0644 Illuminance", illum_data is not None)
 
 if mic_skipped:
-    _log("[SKIP] SPH0645 Microphone — needs audioi2sin (10.3.0-dev nightly)")
+    _log("[SKIP] SPH0645 Microphone — needs audioi2sin (CircuitPython >= 10.3.0)")
 else:
     _result("SPH0645 Microphone", mic_data is not None)
 
